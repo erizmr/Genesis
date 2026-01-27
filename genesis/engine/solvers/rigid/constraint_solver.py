@@ -22,9 +22,13 @@ IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
 
 # Check environment variable for decomposed solver usage
 USE_DECOMPOSED_SOLVER = os.environ.get("GS_SOLVER_DECOMPOSE", "0") == "1"
-
+USE_DECOMPOSED_SOLVER = 1
 # Check environment variable for macro kernel usage (only applies when USE_DECOMPOSED_SOLVER is True)
 USE_DECOMPOSED_MACRO = os.environ.get("GS_SOLVER_DECOMPOSE_MACRO", "0") == "1"
+USE_DECOMPOSED_MACRO = 1
+# Check environment variable for shared memory line search optimization (Strategy B)
+# Set GS_SOLVER_SHARED_MEM=1 to enable shared memory caching during line search
+USE_SHARED_MEM_LINESEARCH = os.environ.get("GS_SOLVER_SHARED_MEM", "0") == "1"
 
 
 class ConstraintSolver:
@@ -193,6 +197,10 @@ class ConstraintSolver:
             GS_SOLVER_DECOMPOSE_MACRO: Set to "1" to use macrokernels (separate kernel per step),
                                        "0" for microkernels (single kernel with multiple loops).
                                        Only applies when GS_SOLVER_DECOMPOSE=1 (default: "0")
+            GS_SOLVER_SHARED_MEM: Set to "1" to use shared memory optimized line search (Strategy B).
+                                  Caches constraint data in GPU shared memory to reduce global memory
+                                  bandwidth during line search iterations. Only applies when
+                                  GS_SOLVER_DECOMPOSE=1 (default: "0")
         """
         if use_decomposed_kernels is None:
             use_decomposed_kernels = USE_DECOMPOSED_SOLVER
@@ -208,12 +216,26 @@ class ConstraintSolver:
 
         if use_decomposed_kernels:
             # Import here to avoid circular dependency and overhead when not needed
-            if USE_DECOMPOSED_MACRO:
+            if USE_SHARED_MEM_LINESEARCH:
+                # Strategy B: Shared memory optimized line search
+                from genesis.engine.solvers.rigid.constraint_solver_breakdown import (
+                    func_solve_shared_mem,
+                )
+
+                # print("use shared memory line search")
+                func_solve_shared_mem(
+                    self._solver.entities_info,
+                    self._solver.dofs_state,
+                    self.constraint_state,
+                    self._solver._rigid_global_info,
+                    self._solver._static_rigid_sim_config,
+                )
+            elif USE_DECOMPOSED_MACRO:
                 from genesis.engine.solvers.rigid.constraint_solver_breakdown import (
                     func_solve_decomposed_macrokernels,
                 )
 
-                print("use decomposed macro")
+                # print("use decomposed macro")
                 func_solve_decomposed_macrokernels(
                     self._solver.entities_info,
                     self._solver.dofs_state,
@@ -226,7 +248,7 @@ class ConstraintSolver:
                     func_solve_decomposed_microkernels,
                 )
 
-                print("use decomposed micro")
+                # print("use decomposed micro")
                 func_solve_decomposed_microkernels(
                     self._solver.entities_info,
                     self._solver.dofs_state,
