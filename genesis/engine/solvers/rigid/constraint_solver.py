@@ -25,11 +25,11 @@ USE_DECOMPOSED_SOLVER = os.environ.get("GS_SOLVER_DECOMPOSE", "0") == "1"
 USE_DECOMPOSED_SOLVER = 1
 # Check environment variable for macro kernel usage (only applies when USE_DECOMPOSED_SOLVER is True)
 USE_DECOMPOSED_MACRO = os.environ.get("GS_SOLVER_DECOMPOSE_MACRO", "0") == "1"
-USE_DECOMPOSED_MACRO = 1
+# USE_DECOMPOSED_MACRO = 1
 # Check environment variable for shared memory line search optimization (Strategy B)
 # Set GS_SOLVER_SHARED_MEM=1 to enable shared memory caching during line search
 USE_SHARED_MEM_LINESEARCH = os.environ.get("GS_SOLVER_SHARED_MEM", "0") == "1"
-
+USE_SHARED_MEM_LINESEARCH = 1
 
 class ConstraintSolver:
     def __init__(self, rigid_solver: "RigidSolver"):
@@ -217,6 +217,7 @@ class ConstraintSolver:
         if use_decomposed_kernels:
             # Import here to avoid circular dependency and overhead when not needed
             if USE_SHARED_MEM_LINESEARCH:
+                print("I am using shem linesearch")
                 # Strategy B: Shared memory optimized line search
                 from genesis.engine.solvers.rigid.constraint_solver_breakdown import (
                     func_solve_shared_mem,

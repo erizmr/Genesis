@@ -920,6 +920,7 @@ def func_solve_shared_mem(
     """
     # Check if shared memory is supported
     if not _is_shared_mem_supported():
+        print("fall back to macro kernels")
         # Fall back to macro kernels on non-CUDA backends
         func_solve_decomposed_macrokernels(
             entities_info,
