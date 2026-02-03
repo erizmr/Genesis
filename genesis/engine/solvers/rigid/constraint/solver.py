@@ -2644,28 +2644,14 @@ def func_linesearch_batch(
                     done = True
 
                 if not done:
-                    # Phase 3: Refinement with batched 3-alpha evaluation
-                    alpha_0 = p1_alpha - p1_deriv_0 / p1_deriv_1  # Newton from p1
-                    alpha_1 = p1_alpha  # p2_next (= current p1)
-                    alpha_2 = (p1_alpha + p2_alpha) * 0.5  # midpoint
+                    # Phase 3: Refinement
+                    if ti.static(USE_LS_OPT):
+                        # Optimized: batched 3-alpha evaluation with local variables
+                        alpha_0 = p1_alpha - p1_deriv_0 / p1_deriv_1  # Newton from p1
+                        alpha_1 = p1_alpha  # p2_next (= current p1)
+                        alpha_2 = (p1_alpha + p2_alpha) * 0.5  # midpoint
 
-                    while constraint_state.ls_it[i_b] < rigid_global_info.ls_iterations[None]:
-                        # Pre-declare all 3-alpha result vars for Taichi scoping
-                        _a0 = gs.ti_float(0.0)
-                        c0 = gs.ti_float(0.0)
-                        c0_d0 = gs.ti_float(0.0)
-                        c0_d1 = gs.ti_float(0.0)
-                        _a1 = gs.ti_float(0.0)
-                        c1 = gs.ti_float(0.0)
-                        c1_d0 = gs.ti_float(0.0)
-                        c1_d1 = gs.ti_float(0.0)
-                        _a2 = gs.ti_float(0.0)
-                        c2 = gs.ti_float(0.0)
-                        c2_d0 = gs.ti_float(0.0)
-                        c2_d1 = gs.ti_float(0.0)
-
-                        # Batch evaluate all 3 in one constraint loop
-                        if ti.static(USE_LS_OPT):
+                        while constraint_state.ls_it[i_b] < rigid_global_info.ls_iterations[None]:
                             (
                                 _a0,
                                 c0,
@@ -2682,125 +2668,203 @@ def func_linesearch_batch(
                             ) = func_ls_point_fn_3alphas_opt(
                                 i_b, alpha_0, alpha_1, alpha_2, constraint_state, rigid_global_info
                             )
-                        else:
-                            (
-                                _a0,
-                                c0,
-                                c0_d0,
-                                c0_d1,
-                                _a1,
-                                c1,
-                                c1_d0,
-                                c1_d1,
-                                _a2,
-                                c2,
-                                c2_d0,
-                                c2_d1,
-                            ) = func_ls_point_fn_3alphas(
-                                i_b, alpha_0, alpha_1, alpha_2, constraint_state, rigid_global_info
-                            )
 
-                        # Check convergence among 3 candidates using local variables
-                        p1_next_alpha = alpha_0
-                        p2_next_alpha = alpha_1
+                            p1_next_alpha = alpha_0
+                            p2_next_alpha = alpha_1
 
-                        best_alpha = gs.ti_float(0.0)
-                        best_cost = gs.ti_float(0.0)
-                        best_found = False
-                        if ti.abs(c0_d0) < gtol:
-                            best_alpha = alpha_0
-                            best_cost = c0
-                            best_found = True
-                        if ti.abs(c1_d0) < gtol and (not best_found or c1 < best_cost):
-                            best_alpha = alpha_1
-                            best_cost = c1
-                            best_found = True
-                        if ti.abs(c2_d0) < gtol and (not best_found or c2 < best_cost):
-                            best_alpha = alpha_2
-                            best_cost = c2
-                            best_found = True
+                            best_alpha = gs.ti_float(0.0)
+                            best_cost = gs.ti_float(0.0)
+                            best_found = False
+                            if ti.abs(c0_d0) < gtol:
+                                best_alpha = alpha_0
+                                best_cost = c0
+                                best_found = True
+                            if ti.abs(c1_d0) < gtol and (not best_found or c1 < best_cost):
+                                best_alpha = alpha_1
+                                best_cost = c1
+                                best_found = True
+                            if ti.abs(c2_d0) < gtol and (not best_found or c2 < best_cost):
+                                best_alpha = alpha_2
+                                best_cost = c2
+                                best_found = True
 
-                        if best_found:
-                            res_alpha = best_alpha
-                            done = True
-                        else:
-                            (
-                                b1,
-                                p1_alpha,
-                                p1_cost,
-                                p1_deriv_0,
-                                p1_deriv_1,
-                                p1_next_alpha,
-                            ) = update_bracket_no_eval_local(
-                                p1_alpha,
-                                p1_cost,
-                                p1_deriv_0,
-                                p1_deriv_1,
-                                alpha_0,
-                                c0,
-                                c0_d0,
-                                c0_d1,
-                                alpha_1,
-                                c1,
-                                c1_d0,
-                                c1_d1,
-                                alpha_2,
-                                c2,
-                                c2_d0,
-                                c2_d1,
-                            )
-                            (
-                                b2,
-                                p2_alpha,
-                                p2_cost,
-                                p2_deriv_0,
-                                p2_deriv_1,
-                                p2_next_alpha,
-                            ) = update_bracket_no_eval_local(
-                                p2_alpha,
-                                p2_cost,
-                                p2_deriv_0,
-                                p2_deriv_1,
-                                alpha_0,
-                                c0,
-                                c0_d0,
-                                c0_d1,
-                                alpha_1,
-                                c1,
-                                c1_d0,
-                                c1_d1,
-                                alpha_2,
-                                c2,
-                                c2_d0,
-                                c2_d1,
-                            )
-
-                            if b1 == 0 and b2 == 0:
-                                if c2 < p0_cost:
-                                    constraint_state.ls_result[i_b] = 0
-                                else:
-                                    constraint_state.ls_result[i_b] = 7
-                                res_alpha = alpha_2
+                            if best_found:
+                                res_alpha = best_alpha
                                 done = True
+                            else:
+                                (
+                                    b1,
+                                    p1_alpha,
+                                    p1_cost,
+                                    p1_deriv_0,
+                                    p1_deriv_1,
+                                    p1_next_alpha,
+                                ) = update_bracket_no_eval_local(
+                                    p1_alpha,
+                                    p1_cost,
+                                    p1_deriv_0,
+                                    p1_deriv_1,
+                                    alpha_0,
+                                    c0,
+                                    c0_d0,
+                                    c0_d1,
+                                    alpha_1,
+                                    c1,
+                                    c1_d0,
+                                    c1_d1,
+                                    alpha_2,
+                                    c2,
+                                    c2_d0,
+                                    c2_d1,
+                                )
+                                (
+                                    b2,
+                                    p2_alpha,
+                                    p2_cost,
+                                    p2_deriv_0,
+                                    p2_deriv_1,
+                                    p2_next_alpha,
+                                ) = update_bracket_no_eval_local(
+                                    p2_alpha,
+                                    p2_cost,
+                                    p2_deriv_0,
+                                    p2_deriv_1,
+                                    alpha_0,
+                                    c0,
+                                    c0_d0,
+                                    c0_d1,
+                                    alpha_1,
+                                    c1,
+                                    c1_d0,
+                                    c1_d1,
+                                    alpha_2,
+                                    c2,
+                                    c2_d0,
+                                    c2_d1,
+                                )
 
-                        if done:
-                            break
+                                if b1 == 0 and b2 == 0:
+                                    if c2 < p0_cost:
+                                        constraint_state.ls_result[i_b] = 0
+                                    else:
+                                        constraint_state.ls_result[i_b] = 7
+                                    res_alpha = alpha_2
+                                    done = True
 
-                        # Compute next 3 alphas for next iteration
-                        alpha_0 = p1_next_alpha
-                        alpha_1 = p2_next_alpha
-                        alpha_2 = (p1_alpha + p2_alpha) * 0.5
+                            if done:
+                                break
 
-                    if not done:
-                        if p1_cost <= p2_cost and p1_cost < p0_cost:
-                            constraint_state.ls_result[i_b] = 4
-                            res_alpha = p1_alpha
-                        elif p2_cost <= p1_cost and p2_cost < p0_cost:
-                            constraint_state.ls_result[i_b] = 4
-                            res_alpha = p2_alpha
-                        else:
-                            constraint_state.ls_result[i_b] = 5
-                            res_alpha = 0.0
+                            alpha_0 = p1_next_alpha
+                            alpha_1 = p2_next_alpha
+                            alpha_2 = (p1_alpha + p2_alpha) * 0.5
+
+                        if not done:
+                            if p1_cost <= p2_cost and p1_cost < p0_cost:
+                                constraint_state.ls_result[i_b] = 4
+                                res_alpha = p1_alpha
+                            elif p2_cost <= p1_cost and p2_cost < p0_cost:
+                                constraint_state.ls_result[i_b] = 4
+                                res_alpha = p2_alpha
+                            else:
+                                constraint_state.ls_result[i_b] = 5
+                                res_alpha = 0.0
+                    else:
+                        # Original: sequential func_ls_point_fn calls with global candidates
+                        p2_next_alpha, p2_next_cost, p2_next_deriv_0, p2_next_deriv_1 = (
+                            p1_alpha,
+                            p1_cost,
+                            p1_deriv_0,
+                            p1_deriv_1,
+                        )
+
+                        p1_next_alpha, p1_next_cost, p1_next_deriv_0, p1_next_deriv_1 = func_ls_point_fn(
+                            i_b, p1_alpha - p1_deriv_0 / p1_deriv_1, constraint_state, rigid_global_info
+                        )
+
+                        while constraint_state.ls_it[i_b] < rigid_global_info.ls_iterations[None]:
+                            pmid_alpha, pmid_cost, pmid_deriv_0, pmid_deriv_1 = func_ls_point_fn(
+                                i_b, (p1_alpha + p2_alpha) * 0.5, constraint_state, rigid_global_info
+                            )
+
+                            i = 0
+                            (
+                                constraint_state.candidates[4 * i + 0, i_b],
+                                constraint_state.candidates[4 * i + 1, i_b],
+                                constraint_state.candidates[4 * i + 2, i_b],
+                                constraint_state.candidates[4 * i + 3, i_b],
+                            ) = (p1_next_alpha, p1_next_cost, p1_next_deriv_0, p1_next_deriv_1)
+                            i = 1
+                            (
+                                constraint_state.candidates[4 * i + 0, i_b],
+                                constraint_state.candidates[4 * i + 1, i_b],
+                                constraint_state.candidates[4 * i + 2, i_b],
+                                constraint_state.candidates[4 * i + 3, i_b],
+                            ) = (p2_next_alpha, p2_next_cost, p2_next_deriv_0, p2_next_deriv_1)
+                            i = 2
+                            (
+                                constraint_state.candidates[4 * i + 0, i_b],
+                                constraint_state.candidates[4 * i + 1, i_b],
+                                constraint_state.candidates[4 * i + 2, i_b],
+                                constraint_state.candidates[4 * i + 3, i_b],
+                            ) = (pmid_alpha, pmid_cost, pmid_deriv_0, pmid_deriv_1)
+
+                            best_i = -1
+                            best_cost = gs.ti_float(0.0)
+                            for ii in range(3):
+                                if ti.abs(constraint_state.candidates[4 * ii + 2, i_b]) < gtol and (
+                                    best_i < 0 or constraint_state.candidates[4 * ii + 1, i_b] < best_cost
+                                ):
+                                    best_cost = constraint_state.candidates[4 * ii + 1, i_b]
+                                    best_i = ii
+                            if best_i >= 0:
+                                res_alpha = constraint_state.candidates[4 * best_i + 0, i_b]
+                                done = True
+                            else:
+                                (
+                                    b1,
+                                    p1_alpha,
+                                    p1_cost,
+                                    p1_deriv_0,
+                                    p1_deriv_1,
+                                    p1_next_alpha,
+                                    p1_next_cost,
+                                    p1_next_deriv_0,
+                                    p1_next_deriv_1,
+                                ) = update_bracket(
+                                    i_b, p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1, constraint_state, rigid_global_info
+                                )
+                                (
+                                    b2,
+                                    p2_alpha,
+                                    p2_cost,
+                                    p2_deriv_0,
+                                    p2_deriv_1,
+                                    p2_next_alpha,
+                                    p2_next_cost,
+                                    p2_next_deriv_0,
+                                    p2_next_deriv_1,
+                                ) = update_bracket(
+                                    i_b, p2_alpha, p2_cost, p2_deriv_0, p2_deriv_1, constraint_state, rigid_global_info
+                                )
+
+                                if b1 == 0 and b2 == 0:
+                                    if pmid_cost < p0_cost:
+                                        constraint_state.ls_result[i_b] = 0
+                                    else:
+                                        constraint_state.ls_result[i_b] = 7
+                                    res_alpha = pmid_alpha
+                                    done = True
+
+                        if not done:
+                            if p1_cost <= p2_cost and p1_cost < p0_cost:
+                                constraint_state.ls_result[i_b] = 4
+                                res_alpha = p1_alpha
+                            elif p2_cost <= p1_cost and p2_cost < p0_cost:
+                                constraint_state.ls_result[i_b] = 4
+                                res_alpha = p2_alpha
+                            else:
+                                constraint_state.ls_result[i_b] = 5
+                                res_alpha = 0.0
     return res_alpha
 
 
