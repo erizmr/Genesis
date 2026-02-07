@@ -21,9 +21,8 @@ if TYPE_CHECKING:
 import os
 
 USE_LS_OPT = os.environ.get("GS_SOLVER_LS_OPT", "0") == "1"
-
-# TODO: set always true for CI benchmark use.
-USE_LS_OPT = 1
+USE_LS_PARALLEL = os.environ.get("GS_SOLVER_LS_PARALLEL", "0") == "1"
+USE_LS_SHARED = os.environ.get("GS_SOLVER_LS_SHARED", "0") == "1"
 
 IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
 
@@ -190,13 +189,19 @@ class ConstraintSolver:
             self._solver._rigid_global_info,
             self._solver._static_rigid_sim_config,
         )
-        func_solve_body(
-            self._solver.entities_info,
-            self._solver.dofs_state,
-            self.constraint_state,
-            self._solver._rigid_global_info,
-            self._solver._static_rigid_sim_config,
-        )
+
+        if USE_LS_SHARED and gs.backend == gs.cuda:
+            self._resolve_body_shared_memory()
+        elif USE_LS_SHARED or USE_LS_PARALLEL:
+            self._resolve_body_parallel()
+        else:
+            func_solve_body(
+                self._solver.entities_info,
+                self._solver.dofs_state,
+                self.constraint_state,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+            )
 
         func_update_qacc(
             self._solver.dofs_state,
@@ -214,6 +219,93 @@ class ConstraintSolver:
             self.constraint_state,
             self._solver._static_rigid_sim_config,
         )
+
+    def _resolve_body_parallel(self):
+        """
+        Parallel constraint linesearch version of the solve body.
+        Uses kernel_linesearch_parallel for parallel constraint evaluation.
+        """
+        iterations = self._solver._options.iterations
+        max_constraints = self.len_constraints_
+        n_dofs = self._solver.n_dofs
+        n_entities = self._solver.n_entities_
+
+        for _ in range(iterations):
+            # Parallel linesearch: evaluates all batches with parallel constraint loop
+            kernel_linesearch_parallel(
+                self._solver.entities_info,
+                self._solver.dofs_state,
+                self._solver._rigid_global_info,
+                self.constraint_state,
+                n_dofs,
+                n_entities,
+                max_constraints,
+                self._B,
+            )
+
+            # Apply results and update constraint state
+            kernel_apply_linesearch_and_update_parallel(
+                self._solver.entities_info,
+                self._solver.dofs_state,
+                self._solver._rigid_global_info,
+                self.constraint_state,
+                self._solver._static_rigid_sim_config,
+                n_dofs,
+                self._B,
+            )
+
+            # Check if any batch improved; if not, all converged
+            any_improved = kernel_check_convergence_parallel(self.constraint_state, self._B)
+            if any_improved == 0:
+                break
+
+    def _resolve_body_shared_memory(self):
+        """
+        Shared memory linesearch version of the solve body.
+        Uses block-based parallelism with shared memory for efficient reduction.
+        Each CUDA block handles one batch independently.
+        """
+        iterations = self._solver._options.iterations
+        max_constraints = self.len_constraints_
+        n_dofs = self._solver.n_dofs
+        n_entities = self._solver.n_entities_
+
+        for _ in range(iterations):
+            # Step 1: Initialize linesearch (compute mv, jv, quad, etc.)
+            kernel_ls_init_shared(
+                self._solver.entities_info,
+                self._solver.dofs_state,
+                self._solver._rigid_global_info,
+                self.constraint_state,
+                n_dofs,
+                n_entities,
+                max_constraints,
+                self._B,
+            )
+
+            # Step 2: Full linesearch with block-local sync
+            kernel_linesearch_block_shared(
+                self._solver._rigid_global_info,
+                self.constraint_state,
+                max_constraints,
+                self._B,
+            )
+
+            # Step 3: Apply result and update state
+            kernel_apply_linesearch_and_update_parallel(
+                self._solver.entities_info,
+                self._solver.dofs_state,
+                self._solver._rigid_global_info,
+                self.constraint_state,
+                self._solver._static_rigid_sim_config,
+                n_dofs,
+                self._B,
+            )
+
+            # Check convergence
+            any_improved = kernel_check_convergence_parallel(self.constraint_state, self._B)
+            if any_improved == 0:
+                break
 
     def noslip(self):
         constraint_noslip.kernel_build_efc_AR_b(
@@ -2868,6 +2960,702 @@ def func_linesearch_batch(
     return res_alpha
 
 
+# =================================== Parallel Constraint Linesearch ===================================
+# State indices for ls_state array
+LS_IDX_PHASE = 0  # 0=eval_p0, 1=eval_p1, 2=bracket, 3=refine, 4=done
+LS_IDX_ALPHA = 1  # Current alpha to evaluate
+LS_IDX_P0_ALPHA = 2
+LS_IDX_P0_COST = 3
+LS_IDX_P0_D0 = 4
+LS_IDX_P0_D1 = 5
+LS_IDX_P1_ALPHA = 6
+LS_IDX_P1_COST = 7
+LS_IDX_P1_D0 = 8
+LS_IDX_P1_D1 = 9
+LS_IDX_P2_ALPHA = 10
+LS_IDX_P2_COST = 11
+LS_IDX_P2_D0 = 12
+LS_IDX_P2_D1 = 13
+LS_IDX_DIRECTION = 14
+LS_IDX_P2UPDATE = 15
+LS_IDX_RES_ALPHA = 16
+LS_IDX_GTOL = 17
+
+LS_PHASE_EVAL_P0 = 0
+LS_PHASE_EVAL_P1 = 1
+LS_PHASE_BRACKET = 2
+LS_PHASE_REFINE = 3
+LS_PHASE_DONE = 4
+
+# Maximum iterations for ti.static unrolling (must be compile-time constant)
+LS_MAX_STATIC_ITER = 40
+
+# Shared memory linesearch constants
+LS_BLOCK_SIZE = 256  # Threads per block
+LS_MAX_ITER = 20  # Max linesearch iterations (dynamic, for shared memory version)
+
+
+# =================================== Shared Memory Linesearch Kernels ===================================
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def kernel_ls_init_shared(
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    constraint_state: array_class.ConstraintState,
+    n_dofs: ti.i32,
+    n_entities: ti.i32,
+    max_constraints: ti.i32,
+    _B: ti.i32,
+):
+    """
+    Initialize linesearch: compute mv, jv, quad_gauss, quad, eq_sum, gtol.
+    These values are constant throughout the linesearch iterations.
+    """
+
+    # === Loop 1: Compute mv (parallel over B) ===
+    for i_b in range(_B):
+        for i_e in range(n_entities):
+            for i_d1 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                mv = gs.ti_float(0.0)
+                for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                    mv = mv + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * constraint_state.search[i_d2, i_b]
+                constraint_state.mv[i_d1, i_b] = mv
+
+    # === Loop 2: Compute jv (parallel over B × max_constraints) ===
+    for i_b, i_c in ti.ndrange(_B, max_constraints):
+        if i_c < constraint_state.n_constraints[i_b]:
+            jv = gs.ti_float(0.0)
+            for i_d in range(n_dofs):
+                jv = jv + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+            constraint_state.jv[i_c, i_b] = jv
+
+    # === Loop 3: Compute quad (parallel over B × max_constraints) ===
+    for i_b, i_c in ti.ndrange(_B, max_constraints):
+        if i_c < constraint_state.n_constraints[i_b]:
+            D = constraint_state.efc_D[i_c, i_b]
+            Jaref = constraint_state.Jaref[i_c, i_b]
+            jv = constraint_state.jv[i_c, i_b]
+            constraint_state.quad[i_c, 0, i_b] = D * 0.5 * Jaref * Jaref
+            constraint_state.quad[i_c, 1, i_b] = D * jv * Jaref
+            constraint_state.quad[i_c, 2, i_b] = D * 0.5 * jv * jv
+
+    # === Loop 4: Compute quad_gauss, eq_sum, snorm, gtol (parallel over B) ===
+    for i_b in range(_B):
+        n_con = constraint_state.n_constraints[i_b]
+        ne = constraint_state.n_constraints_equality[i_b]
+
+        # quad_gauss
+        quad_gauss_1 = gs.ti_float(0.0)
+        quad_gauss_2 = gs.ti_float(0.0)
+        for i_d in range(n_dofs):
+            quad_gauss_1 = quad_gauss_1 + (
+                constraint_state.search[i_d, i_b] * constraint_state.Ma[i_d, i_b]
+                - constraint_state.search[i_d, i_b] * dofs_state.force[i_d, i_b]
+            )
+            quad_gauss_2 = quad_gauss_2 + 0.5 * constraint_state.search[i_d, i_b] * constraint_state.mv[i_d, i_b]
+        constraint_state.quad_gauss[0, i_b] = constraint_state.gauss[i_b]
+        constraint_state.quad_gauss[1, i_b] = quad_gauss_1
+        constraint_state.quad_gauss[2, i_b] = quad_gauss_2
+
+        # eq_sum (sum of equality constraint quad values)
+        eq_sum_0 = gs.ti_float(0.0)
+        eq_sum_1 = gs.ti_float(0.0)
+        eq_sum_2 = gs.ti_float(0.0)
+        for i_c in range(ne):
+            eq_sum_0 = eq_sum_0 + constraint_state.quad[i_c, 0, i_b]
+            eq_sum_1 = eq_sum_1 + constraint_state.quad[i_c, 1, i_b]
+            eq_sum_2 = eq_sum_2 + constraint_state.quad[i_c, 2, i_b]
+        constraint_state.eq_sum[0, i_b] = eq_sum_0
+        constraint_state.eq_sum[1, i_b] = eq_sum_1
+        constraint_state.eq_sum[2, i_b] = eq_sum_2
+
+        # snorm and gtol
+        snorm = gs.ti_float(0.0)
+        for i_d in range(n_dofs):
+            snorm = snorm + constraint_state.search[i_d, i_b] ** 2
+        snorm = ti.sqrt(snorm)
+        scale = rigid_global_info.meaninertia[i_b] * ti.max(1, n_dofs)
+        gtol = rigid_global_info.tolerance[None] * rigid_global_info.ls_tolerance[None] * snorm * scale
+        constraint_state.gtol[i_b] = gtol
+
+        # Initialize linesearch state
+        constraint_state.ls_it[i_b] = 0
+        constraint_state.ls_result[i_b] = 0
+        if snorm < rigid_global_info.EPS[None]:
+            constraint_state.ls_result[i_b] = 1  # Zero search direction
+            constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = 0.0
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def kernel_linesearch_block_shared(
+    rigid_global_info: array_class.RigidGlobalInfo,
+    constraint_state: array_class.ConstraintState,
+    max_constraints: ti.i32,
+    _B: ti.i32,
+):
+    """
+    Block-based linesearch with shared memory reduction.
+    Each block handles one batch independently.
+    Launch: _B blocks × LS_BLOCK_SIZE threads
+    """
+    ti.loop_config(block_dim=LS_BLOCK_SIZE)
+    for i in range(_B * LS_BLOCK_SIZE):
+        i_b = i // LS_BLOCK_SIZE
+        tid = i % LS_BLOCK_SIZE
+
+        # ==================== Shared Memory ====================
+        # Partial sums for tree reduction
+        partial = ti.simt.block.SharedArray((LS_BLOCK_SIZE, 3), dtype=gs.ti_float)
+        # Linesearch state machine (shared within block)
+        sh_phase = ti.simt.block.SharedArray((1,), dtype=ti.i32)
+        sh_alpha = ti.simt.block.SharedArray((1,), dtype=gs.ti_float)
+        sh_gtol = ti.simt.block.SharedArray((1,), dtype=gs.ti_float)
+        # Point storage: [alpha, cost, d0, d1]
+        sh_p0 = ti.simt.block.SharedArray((4,), dtype=gs.ti_float)
+        sh_p1 = ti.simt.block.SharedArray((4,), dtype=gs.ti_float)
+        sh_p2 = ti.simt.block.SharedArray((4,), dtype=gs.ti_float)
+        # Bracketing state
+        sh_direction = ti.simt.block.SharedArray((1,), dtype=gs.ti_float)
+        sh_p2update = ti.simt.block.SharedArray((1,), dtype=gs.ti_float)
+
+        # ==================== Load Constants ====================
+        n_con = constraint_state.n_constraints[i_b]
+        ne = constraint_state.n_constraints_equality[i_b]
+        nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+
+        # ==================== Initialize (thread 0) ====================
+        if tid == 0:
+            # Check if already done (zero search direction)
+            if constraint_state.ls_result[i_b] == 1:
+                sh_phase[0] = LS_PHASE_DONE
+            else:
+                sh_phase[0] = LS_PHASE_EVAL_P0
+                sh_alpha[0] = 0.0
+            sh_gtol[0] = constraint_state.gtol[i_b]
+        ti.simt.block.sync()
+
+        # ==================== Main Linesearch Loop ====================
+        for _iter in range(LS_MAX_ITER):
+            phase = sh_phase[0]
+            if phase == LS_PHASE_DONE:
+                break
+
+            alpha = sh_alpha[0]
+
+            # --- Step A: Initialize partial sums ---
+            partial[tid, 0] = 0.0
+            partial[tid, 1] = 0.0
+            partial[tid, 2] = 0.0
+            ti.simt.block.sync()
+
+            # --- Step B: Evaluate constraints (strided) ---
+            i_c = ne + tid  # Start after equality constraints
+            while i_c < n_con:
+                x = constraint_state.Jaref[i_c, i_b] + alpha * constraint_state.jv[i_c, i_b]
+                qf_0 = constraint_state.quad[i_c, 0, i_b]
+                qf_1 = constraint_state.quad[i_c, 1, i_b]
+                qf_2 = constraint_state.quad[i_c, 2, i_b]
+
+                if i_c < nef:
+                    # Frictionloss constraint
+                    f = constraint_state.efc_frictionloss[i_c, i_b]
+                    r = constraint_state.diag[i_c, i_b]
+                    rf = r * f
+                    if x <= -rf:
+                        Jaref_c = constraint_state.Jaref[i_c, i_b]
+                        jv_c = constraint_state.jv[i_c, i_b]
+                        partial[tid, 0] += f * (-0.5 * rf - Jaref_c)
+                        partial[tid, 1] += -f * jv_c
+                    elif x >= rf:
+                        Jaref_c = constraint_state.Jaref[i_c, i_b]
+                        jv_c = constraint_state.jv[i_c, i_b]
+                        partial[tid, 0] += f * (-0.5 * rf + Jaref_c)
+                        partial[tid, 1] += f * jv_c
+                    else:
+                        partial[tid, 0] += qf_0
+                        partial[tid, 1] += qf_1
+                        partial[tid, 2] += qf_2
+                else:
+                    # Contact constraint: active if x < 0
+                    if x < 0:
+                        partial[tid, 0] += qf_0
+                        partial[tid, 1] += qf_1
+                        partial[tid, 2] += qf_2
+
+                i_c += LS_BLOCK_SIZE
+            ti.simt.block.sync()
+
+            # --- Step C: Tree reduction ---
+            stride = LS_BLOCK_SIZE // 2
+            while stride > 0:
+                if tid < stride:
+                    partial[tid, 0] += partial[tid + stride, 0]
+                    partial[tid, 1] += partial[tid + stride, 1]
+                    partial[tid, 2] += partial[tid + stride, 2]
+                ti.simt.block.sync()
+                stride //= 2
+
+            # --- Step D: Compute cost/derivatives, update state machine (thread 0) ---
+            if tid == 0:
+                # Add quad_gauss and eq_sum
+                tmp_0 = partial[0, 0] + constraint_state.quad_gauss[0, i_b] + constraint_state.eq_sum[0, i_b]
+                tmp_1 = partial[0, 1] + constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b]
+                tmp_2 = partial[0, 2] + constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b]
+
+                cost = alpha * alpha * tmp_2 + alpha * tmp_1 + tmp_0
+                d0 = 2.0 * alpha * tmp_2 + tmp_1
+                d1 = 2.0 * tmp_2
+                if d1 <= 0.0:
+                    d1 = rigid_global_info.EPS[None]
+
+                constraint_state.ls_it[i_b] = constraint_state.ls_it[i_b] + 1
+                gtol = sh_gtol[0]
+
+                # ===== State Machine Transitions =====
+                if phase == LS_PHASE_EVAL_P0:
+                    sh_p0[0], sh_p0[1], sh_p0[2], sh_p0[3] = alpha, cost, d0, d1
+                    sh_alpha[0] = alpha - d0 / d1  # Newton step
+                    sh_phase[0] = LS_PHASE_EVAL_P1
+
+                elif phase == LS_PHASE_EVAL_P1:
+                    p0_alpha, p0_cost, p0_d0, p0_d1 = sh_p0[0], sh_p0[1], sh_p0[2], sh_p0[3]
+                    if p0_cost < cost:
+                        alpha, cost, d0, d1 = p0_alpha, p0_cost, p0_d0, p0_d1
+                    sh_p1[0], sh_p1[1], sh_p1[2], sh_p1[3] = alpha, cost, d0, d1
+
+                    if ti.abs(d0) < gtol:
+                        if ti.abs(alpha) < rigid_global_info.EPS[None]:
+                            constraint_state.ls_result[i_b] = 2
+                        else:
+                            constraint_state.ls_result[i_b] = 0
+                        constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = alpha
+                        sh_phase[0] = LS_PHASE_DONE
+                    else:
+                        direction = gs.ti_float(1.0) if d0 < 0 else gs.ti_float(-1.0)
+                        sh_direction[0] = direction
+                        sh_p2update[0] = 0.0
+                        sh_p2[0], sh_p2[1], sh_p2[2], sh_p2[3] = alpha, cost, d0, d1
+                        sh_alpha[0] = alpha - d0 / d1
+                        sh_phase[0] = LS_PHASE_BRACKET
+
+                elif phase == LS_PHASE_BRACKET:
+                    p1_d0 = sh_p1[2]
+                    direction = sh_direction[0]
+
+                    if ti.abs(d0) < gtol:
+                        constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = alpha
+                        sh_phase[0] = LS_PHASE_DONE
+                    elif constraint_state.ls_it[i_b] >= rigid_global_info.ls_iterations[None]:
+                        constraint_state.ls_result[i_b] = 3
+                        constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = alpha
+                        sh_phase[0] = LS_PHASE_DONE
+                    elif p1_d0 * direction > -gtol:
+                        if sh_p2update[0] < 0.5:
+                            constraint_state.ls_result[i_b] = 6
+                            constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = alpha
+                            sh_phase[0] = LS_PHASE_DONE
+                        else:
+                            sh_phase[0] = LS_PHASE_REFINE
+                            p1_alpha = sh_p1[0]
+                            p2_alpha = sh_p2[0]
+                            sh_alpha[0] = (p1_alpha + p2_alpha) * 0.5
+                    else:
+                        # Shift: p2 <- p1, p1 <- current
+                        sh_p2[0], sh_p2[1], sh_p2[2], sh_p2[3] = sh_p1[0], sh_p1[1], sh_p1[2], sh_p1[3]
+                        sh_p2update[0] = 1.0
+                        sh_p1[0], sh_p1[1], sh_p1[2], sh_p1[3] = alpha, cost, d0, d1
+                        sh_alpha[0] = alpha - d0 / d1
+
+                elif phase == LS_PHASE_REFINE:
+                    p0_cost = sh_p0[1]
+                    p1_alpha, p1_cost, p1_d0 = sh_p1[0], sh_p1[1], sh_p1[2]
+                    p2_alpha, p2_cost, p2_d0 = sh_p2[0], sh_p2[1], sh_p2[2]
+
+                    if ti.abs(d0) < gtol:
+                        constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = alpha
+                        sh_phase[0] = LS_PHASE_DONE
+                    elif constraint_state.ls_it[i_b] >= rigid_global_info.ls_iterations[None]:
+                        if p1_cost <= p2_cost and p1_cost < p0_cost:
+                            constraint_state.ls_result[i_b] = 4
+                            constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = p1_alpha
+                        elif p2_cost <= p1_cost and p2_cost < p0_cost:
+                            constraint_state.ls_result[i_b] = 4
+                            constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = p2_alpha
+                        else:
+                            constraint_state.ls_result[i_b] = 5
+                            constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = 0.0
+                        sh_phase[0] = LS_PHASE_DONE
+                    else:
+                        # Update bracket based on derivative signs
+                        if (p1_d0 < 0 and d0 < 0) or (p1_d0 > 0 and d0 > 0):
+                            if (p1_d0 < 0 and d0 > p1_d0) or (p1_d0 > 0 and d0 < p1_d0):
+                                sh_p1[0], sh_p1[1], sh_p1[2], sh_p1[3] = alpha, cost, d0, d1
+                        if (p2_d0 < 0 and d0 < 0) or (p2_d0 > 0 and d0 > 0):
+                            if (p2_d0 < 0 and d0 > p2_d0) or (p2_d0 > 0 and d0 < p2_d0):
+                                sh_p2[0], sh_p2[1], sh_p2[2], sh_p2[3] = alpha, cost, d0, d1
+                        p1_alpha_new = sh_p1[0]
+                        p2_alpha_new = sh_p2[0]
+                        sh_alpha[0] = (p1_alpha_new + p2_alpha_new) * 0.5
+
+            ti.simt.block.sync()  # All threads wait for state update
+
+        # ===== Write final result to global memory =====
+        if tid == 0:
+            # Only write if not already written during state machine
+            if sh_phase[0] != LS_PHASE_DONE:
+                # Max iterations reached without convergence
+                constraint_state.ls_result[i_b] = 3
+                constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = sh_alpha[0]
+
+
+# =================================== Original Parallel Constraint Linesearch ===================================
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def kernel_linesearch_parallel(
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    constraint_state: array_class.ConstraintState,
+    n_dofs: ti.i32,
+    n_entities: ti.i32,
+    max_constraints: ti.i32,
+    _B: ti.i32,
+):
+    """
+    Parallel constraint linesearch using atomic operations.
+    Parallelizes over (batch, constraint) dimensions using ti.ndrange.
+    Uses ti.static loop unrolling for the linesearch iterations.
+    """
+
+    # ==================== Phase 0: Initialization ====================
+    # Compute mv, jv, quad_gauss, quad (same as func_ls_init)
+    for i_b in range(_B):
+        # mv computation
+        for i_e in range(n_entities):
+            for i_d1 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                mv = gs.ti_float(0.0)
+                for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                    mv = mv + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * constraint_state.search[i_d2, i_b]
+                constraint_state.mv[i_d1, i_b] = mv
+
+    for i_b in range(_B):
+        n_con = constraint_state.n_constraints[i_b]
+        for i_c in range(n_con):
+            jv = gs.ti_float(0.0)
+            for i_d in range(n_dofs):
+                jv = jv + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+            constraint_state.jv[i_c, i_b] = jv
+
+    for i_b in range(_B):
+        # quad_gauss computation
+        quad_gauss_1 = gs.ti_float(0.0)
+        quad_gauss_2 = gs.ti_float(0.0)
+        for i_d in range(n_dofs):
+            quad_gauss_1 = quad_gauss_1 + (
+                constraint_state.search[i_d, i_b] * constraint_state.Ma[i_d, i_b]
+                - constraint_state.search[i_d, i_b] * dofs_state.force[i_d, i_b]
+            )
+            quad_gauss_2 = quad_gauss_2 + 0.5 * constraint_state.search[i_d, i_b] * constraint_state.mv[i_d, i_b]
+        constraint_state.quad_gauss[0, i_b] = constraint_state.gauss[i_b]
+        constraint_state.quad_gauss[1, i_b] = quad_gauss_1
+        constraint_state.quad_gauss[2, i_b] = quad_gauss_2
+
+        # quad computation
+        n_con = constraint_state.n_constraints[i_b]
+        for i_c in range(n_con):
+            constraint_state.quad[i_c, 0, i_b] = constraint_state.efc_D[i_c, i_b] * (
+                0.5 * constraint_state.Jaref[i_c, i_b] * constraint_state.Jaref[i_c, i_b]
+            )
+            constraint_state.quad[i_c, 1, i_b] = constraint_state.efc_D[i_c, i_b] * (
+                constraint_state.jv[i_c, i_b] * constraint_state.Jaref[i_c, i_b]
+            )
+            constraint_state.quad[i_c, 2, i_b] = constraint_state.efc_D[i_c, i_b] * (
+                0.5 * constraint_state.jv[i_c, i_b] * constraint_state.jv[i_c, i_b]
+            )
+
+        # Compute eq_sum (sum of equality constraint contributions)
+        ne = constraint_state.n_constraints_equality[i_b]
+        eq_sum_0 = gs.ti_float(0.0)
+        eq_sum_1 = gs.ti_float(0.0)
+        eq_sum_2 = gs.ti_float(0.0)
+        for i_c in range(ne):
+            eq_sum_0 = eq_sum_0 + constraint_state.quad[i_c, 0, i_b]
+            eq_sum_1 = eq_sum_1 + constraint_state.quad[i_c, 1, i_b]
+            eq_sum_2 = eq_sum_2 + constraint_state.quad[i_c, 2, i_b]
+        constraint_state.eq_sum[0, i_b] = eq_sum_0
+        constraint_state.eq_sum[1, i_b] = eq_sum_1
+        constraint_state.eq_sum[2, i_b] = eq_sum_2
+
+        # Compute snorm and gtol
+        snorm = gs.ti_float(0.0)
+        for jd in range(n_dofs):
+            snorm = snorm + constraint_state.search[jd, i_b] ** 2
+        snorm = ti.sqrt(snorm)
+        scale = rigid_global_info.meaninertia[i_b] * ti.max(1, n_dofs)
+        gtol = rigid_global_info.tolerance[None] * rigid_global_info.ls_tolerance[None] * snorm * scale
+        constraint_state.gtol[i_b] = gtol
+
+        # Initialize linesearch state
+        constraint_state.ls_it[i_b] = 0
+        constraint_state.ls_result[i_b] = 0
+
+        if snorm < rigid_global_info.EPS[None]:
+            constraint_state.ls_result[i_b] = 1
+            constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = 0.0
+            constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_DONE
+        else:
+            constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_EVAL_P0
+            constraint_state.ls_state[LS_IDX_ALPHA, i_b] = 0.0  # Start with alpha=0
+            constraint_state.ls_state[LS_IDX_GTOL, i_b] = gtol
+
+    # ==================== Main Iteration Loop (ti.static unrolled) ====================
+    for _iter in ti.static(range(LS_MAX_STATIC_ITER)):
+        # Step A: Initialize accumulators for batches that need evaluation
+        for i_b in range(_B):
+            phase = ti.cast(constraint_state.ls_state[LS_IDX_PHASE, i_b], ti.i32)
+            if phase != LS_PHASE_DONE:
+                # Reset accumulator with quad_gauss + eq_sum (skip equality constraints)
+                constraint_state.ls_accum[0, i_b] = constraint_state.quad_gauss[0, i_b] + constraint_state.eq_sum[0, i_b]
+                constraint_state.ls_accum[1, i_b] = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b]
+                constraint_state.ls_accum[2, i_b] = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b]
+
+        # Step B: Parallel constraint evaluation (parallel over batch × constraint)
+        for i_b, i_c in ti.ndrange(_B, max_constraints):
+            phase = ti.cast(constraint_state.ls_state[LS_IDX_PHASE, i_b], ti.i32)
+            ne = constraint_state.n_constraints_equality[i_b]
+            nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+            n_con = constraint_state.n_constraints[i_b]
+
+            # Skip if done or constraint out of range or equality constraint (already in eq_sum)
+            if phase != LS_PHASE_DONE and i_c >= ne and i_c < n_con:
+                alpha = constraint_state.ls_state[LS_IDX_ALPHA, i_b]
+                x = constraint_state.Jaref[i_c, i_b] + alpha * constraint_state.jv[i_c, i_b]
+                qf_0 = constraint_state.quad[i_c, 0, i_b]
+                qf_1 = constraint_state.quad[i_c, 1, i_b]
+                qf_2 = constraint_state.quad[i_c, 2, i_b]
+
+                contrib_0 = gs.ti_float(0.0)
+                contrib_1 = gs.ti_float(0.0)
+                contrib_2 = gs.ti_float(0.0)
+
+                if i_c < nef:
+                    # Friction constraint
+                    f = constraint_state.efc_frictionloss[i_c, i_b]
+                    r = constraint_state.diag[i_c, i_b]
+                    rf = r * f
+                    linear_neg = x <= -rf
+                    linear_pos = x >= rf
+                    if linear_neg or linear_pos:
+                        Jaref_c = constraint_state.Jaref[i_c, i_b]
+                        jv_c = constraint_state.jv[i_c, i_b]
+                        contrib_0 = linear_neg * f * (-0.5 * rf - Jaref_c) + linear_pos * f * (-0.5 * rf + Jaref_c)
+                        contrib_1 = linear_neg * (-f * jv_c) + linear_pos * (f * jv_c)
+                        contrib_2 = 0.0
+                    else:
+                        contrib_0 = qf_0
+                        contrib_1 = qf_1
+                        contrib_2 = qf_2
+                else:
+                    # Contact constraint: active if x < 0
+                    active = gs.ti_float(x < 0)
+                    contrib_0 = qf_0 * active
+                    contrib_1 = qf_1 * active
+                    contrib_2 = qf_2 * active
+
+                # Atomic add to accumulator
+                ti.atomic_add(constraint_state.ls_accum[0, i_b], contrib_0)
+                ti.atomic_add(constraint_state.ls_accum[1, i_b], contrib_1)
+                ti.atomic_add(constraint_state.ls_accum[2, i_b], contrib_2)
+
+        # Step C: Compute result and update state machine
+        for i_b in range(_B):
+            phase = ti.cast(constraint_state.ls_state[LS_IDX_PHASE, i_b], ti.i32)
+            if phase != LS_PHASE_DONE:
+                # Compute cost and derivatives from accumulated values
+                tmp_0 = constraint_state.ls_accum[0, i_b]
+                tmp_1 = constraint_state.ls_accum[1, i_b]
+                tmp_2 = constraint_state.ls_accum[2, i_b]
+                alpha = constraint_state.ls_state[LS_IDX_ALPHA, i_b]
+                gtol = constraint_state.ls_state[LS_IDX_GTOL, i_b]
+
+                cost = alpha * alpha * tmp_2 + alpha * tmp_1 + tmp_0
+                d0 = 2 * alpha * tmp_2 + tmp_1
+                d1 = 2 * tmp_2
+                if d1 <= 0.0:
+                    d1 = rigid_global_info.EPS[None]
+
+                constraint_state.ls_it[i_b] = constraint_state.ls_it[i_b] + 1
+
+                # State machine transitions
+                if phase == LS_PHASE_EVAL_P0:
+                    # Store p0 result, prepare p1 evaluation
+                    constraint_state.ls_state[LS_IDX_P0_ALPHA, i_b] = alpha
+                    constraint_state.ls_state[LS_IDX_P0_COST, i_b] = cost
+                    constraint_state.ls_state[LS_IDX_P0_D0, i_b] = d0
+                    constraint_state.ls_state[LS_IDX_P0_D1, i_b] = d1
+                    # Next: evaluate at Newton step
+                    constraint_state.ls_state[LS_IDX_ALPHA, i_b] = alpha - d0 / d1
+                    constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_EVAL_P1
+
+                elif phase == LS_PHASE_EVAL_P1:
+                    p0_cost = constraint_state.ls_state[LS_IDX_P0_COST, i_b]
+                    p0_alpha = constraint_state.ls_state[LS_IDX_P0_ALPHA, i_b]
+                    p0_d0 = constraint_state.ls_state[LS_IDX_P0_D0, i_b]
+                    p0_d1 = constraint_state.ls_state[LS_IDX_P0_D1, i_b]
+
+                    # If p1 is worse than p0, use p0
+                    if p0_cost < cost:
+                        alpha = p0_alpha
+                        cost = p0_cost
+                        d0 = p0_d0
+                        d1 = p0_d1
+
+                    # Store p1 result
+                    constraint_state.ls_state[LS_IDX_P1_ALPHA, i_b] = alpha
+                    constraint_state.ls_state[LS_IDX_P1_COST, i_b] = cost
+                    constraint_state.ls_state[LS_IDX_P1_D0, i_b] = d0
+                    constraint_state.ls_state[LS_IDX_P1_D1, i_b] = d1
+
+                    # Check convergence
+                    if ti.abs(d0) < gtol:
+                        if ti.abs(alpha) < rigid_global_info.EPS[None]:
+                            constraint_state.ls_result[i_b] = 2
+                        else:
+                            constraint_state.ls_result[i_b] = 0
+                        constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = alpha
+                        constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_DONE
+                    else:
+                        # Enter bracketing phase
+                        direction = gs.ti_float((d0 < 0) * 2 - 1)
+                        constraint_state.ls_state[LS_IDX_DIRECTION, i_b] = direction
+                        constraint_state.ls_state[LS_IDX_P2UPDATE, i_b] = 0.0
+                        constraint_state.ls_state[LS_IDX_P2_ALPHA, i_b] = alpha
+                        constraint_state.ls_state[LS_IDX_P2_COST, i_b] = cost
+                        constraint_state.ls_state[LS_IDX_P2_D0, i_b] = d0
+                        constraint_state.ls_state[LS_IDX_P2_D1, i_b] = d1
+                        # Next: Newton step for bracketing
+                        constraint_state.ls_state[LS_IDX_ALPHA, i_b] = alpha - d0 / d1
+                        constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_BRACKET
+
+                elif phase == LS_PHASE_BRACKET:
+                    p1_d0 = constraint_state.ls_state[LS_IDX_P1_D0, i_b]
+                    direction = constraint_state.ls_state[LS_IDX_DIRECTION, i_b]
+                    gtol = constraint_state.ls_state[LS_IDX_GTOL, i_b]
+
+                    # Check convergence
+                    if ti.abs(d0) < gtol:
+                        constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = alpha
+                        constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_DONE
+                    elif constraint_state.ls_it[i_b] >= rigid_global_info.ls_iterations[None]:
+                        # Max iterations reached
+                        constraint_state.ls_result[i_b] = 3
+                        constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = alpha
+                        constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_DONE
+                    elif p1_d0 * direction > -gtol:
+                        # Sign changed or tolerance met - bracket found
+                        p2update = constraint_state.ls_state[LS_IDX_P2UPDATE, i_b]
+                        if p2update < 0.5:
+                            # Never entered while loop
+                            constraint_state.ls_result[i_b] = 6
+                            constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = alpha
+                            constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_DONE
+                        else:
+                            # Enter refinement phase
+                            constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_REFINE
+                            # Evaluate midpoint next
+                            p1_alpha = constraint_state.ls_state[LS_IDX_P1_ALPHA, i_b]
+                            p2_alpha = constraint_state.ls_state[LS_IDX_P2_ALPHA, i_b]
+                            constraint_state.ls_state[LS_IDX_ALPHA, i_b] = (p1_alpha + p2_alpha) * 0.5
+                    else:
+                        # Continue bracketing: shift p2 <- p1, p1 <- current
+                        constraint_state.ls_state[LS_IDX_P2_ALPHA, i_b] = constraint_state.ls_state[LS_IDX_P1_ALPHA, i_b]
+                        constraint_state.ls_state[LS_IDX_P2_COST, i_b] = constraint_state.ls_state[LS_IDX_P1_COST, i_b]
+                        constraint_state.ls_state[LS_IDX_P2_D0, i_b] = constraint_state.ls_state[LS_IDX_P1_D0, i_b]
+                        constraint_state.ls_state[LS_IDX_P2_D1, i_b] = constraint_state.ls_state[LS_IDX_P1_D1, i_b]
+                        constraint_state.ls_state[LS_IDX_P2UPDATE, i_b] = 1.0
+
+                        constraint_state.ls_state[LS_IDX_P1_ALPHA, i_b] = alpha
+                        constraint_state.ls_state[LS_IDX_P1_COST, i_b] = cost
+                        constraint_state.ls_state[LS_IDX_P1_D0, i_b] = d0
+                        constraint_state.ls_state[LS_IDX_P1_D1, i_b] = d1
+                        # Next: Newton step
+                        constraint_state.ls_state[LS_IDX_ALPHA, i_b] = alpha - d0 / d1
+
+                elif phase == LS_PHASE_REFINE:
+                    # Simplified refinement: just check midpoint and update bracket
+                    gtol = constraint_state.ls_state[LS_IDX_GTOL, i_b]
+                    p0_cost = constraint_state.ls_state[LS_IDX_P0_COST, i_b]
+                    p1_alpha = constraint_state.ls_state[LS_IDX_P1_ALPHA, i_b]
+                    p1_cost = constraint_state.ls_state[LS_IDX_P1_COST, i_b]
+                    p1_d0 = constraint_state.ls_state[LS_IDX_P1_D0, i_b]
+                    p2_alpha = constraint_state.ls_state[LS_IDX_P2_ALPHA, i_b]
+                    p2_cost = constraint_state.ls_state[LS_IDX_P2_COST, i_b]
+                    p2_d0 = constraint_state.ls_state[LS_IDX_P2_D0, i_b]
+
+                    if ti.abs(d0) < gtol:
+                        constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = alpha
+                        constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_DONE
+                    elif constraint_state.ls_it[i_b] >= rigid_global_info.ls_iterations[None]:
+                        # Max iterations - pick best
+                        if p1_cost <= p2_cost and p1_cost < p0_cost:
+                            constraint_state.ls_result[i_b] = 4
+                            constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = p1_alpha
+                        elif p2_cost <= p1_cost and p2_cost < p0_cost:
+                            constraint_state.ls_result[i_b] = 4
+                            constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = p2_alpha
+                        else:
+                            constraint_state.ls_result[i_b] = 5
+                            constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b] = 0.0
+                        constraint_state.ls_state[LS_IDX_PHASE, i_b] = LS_PHASE_DONE
+                    else:
+                        # Update bracket based on midpoint
+                        # If midpoint has same sign as p1, replace p1; else replace p2
+                        if (p1_d0 < 0 and d0 < 0) or (p1_d0 > 0 and d0 > 0):
+                            if (p1_d0 < 0 and d0 > p1_d0) or (p1_d0 > 0 and d0 < p1_d0):
+                                constraint_state.ls_state[LS_IDX_P1_ALPHA, i_b] = alpha
+                                constraint_state.ls_state[LS_IDX_P1_COST, i_b] = cost
+                                constraint_state.ls_state[LS_IDX_P1_D0, i_b] = d0
+                                constraint_state.ls_state[LS_IDX_P1_D1, i_b] = d1
+                        if (p2_d0 < 0 and d0 < 0) or (p2_d0 > 0 and d0 > 0):
+                            if (p2_d0 < 0 and d0 > p2_d0) or (p2_d0 > 0 and d0 < p2_d0):
+                                constraint_state.ls_state[LS_IDX_P2_ALPHA, i_b] = alpha
+                                constraint_state.ls_state[LS_IDX_P2_COST, i_b] = cost
+                                constraint_state.ls_state[LS_IDX_P2_D0, i_b] = d0
+                                constraint_state.ls_state[LS_IDX_P2_D1, i_b] = d1
+
+                        # Next: evaluate new midpoint
+                        p1_alpha_new = constraint_state.ls_state[LS_IDX_P1_ALPHA, i_b]
+                        p2_alpha_new = constraint_state.ls_state[LS_IDX_P2_ALPHA, i_b]
+                        constraint_state.ls_state[LS_IDX_ALPHA, i_b] = (p1_alpha_new + p2_alpha_new) * 0.5
+
+
+@ti.func
+def func_linesearch_parallel_apply(
+    i_b,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+):
+    """Apply linesearch result after kernel_linesearch_parallel has been called."""
+    n_dofs = constraint_state.qacc.shape[0]
+    alpha = constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b]
+
+    if ti.abs(alpha) < rigid_global_info.EPS[None]:
+        constraint_state.improved[i_b] = False
+    else:
+        constraint_state.improved[i_b] = True
+        for i_d in range(n_dofs):
+            constraint_state.qacc[i_d, i_b] = (
+                constraint_state.qacc[i_d, i_b] + constraint_state.search[i_d, i_b] * alpha
+            )
+            constraint_state.Ma[i_d, i_b] = constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
+
+        for i_c in range(constraint_state.n_constraints[i_b]):
+            constraint_state.Jaref[i_c, i_b] = constraint_state.Jaref[i_c, i_b] + constraint_state.jv[i_c, i_b] * alpha
+
+
 # =====================================================================================================================
 # ================================================= Solving Algorithm =================================================
 # =====================================================================================================================
@@ -3415,6 +4203,91 @@ def func_solve_body(
                     break
         else:
             constraint_state.improved[i_b] = False
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def kernel_apply_linesearch_and_update_parallel(
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: ti.template(),
+    n_dofs: ti.i32,
+    _B: ti.i32,
+):
+    """
+    Apply the linesearch result from kernel_linesearch_parallel and update constraint state.
+    This is the second kernel in the parallel linesearch solver iteration.
+    """
+
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0:
+            alpha = constraint_state.ls_state[LS_IDX_RES_ALPHA, i_b]
+
+            if ti.abs(alpha) < rigid_global_info.EPS[None]:
+                constraint_state.improved[i_b] = False
+            else:
+                constraint_state.improved[i_b] = True
+
+                # Update qacc, Ma
+                for i_d in range(n_dofs):
+                    constraint_state.qacc[i_d, i_b] = (
+                        constraint_state.qacc[i_d, i_b] + constraint_state.search[i_d, i_b] * alpha
+                    )
+                    constraint_state.Ma[i_d, i_b] = (
+                        constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
+                    )
+
+                # Update Jaref
+                for i_c in range(constraint_state.n_constraints[i_b]):
+                    constraint_state.Jaref[i_c, i_b] = (
+                        constraint_state.Jaref[i_c, i_b] + constraint_state.jv[i_c, i_b] * alpha
+                    )
+
+                # Update constraint state (cost, active flags, etc.)
+                func_update_constraint_batch(
+                    i_b,
+                    qacc=constraint_state.qacc,
+                    Ma=constraint_state.Ma,
+                    cost=constraint_state.cost,
+                    dofs_state=dofs_state,
+                    constraint_state=constraint_state,
+                    static_rigid_sim_config=static_rigid_sim_config,
+                )
+
+                # Update gradient
+                func_update_gradient_batch(
+                    i_b,
+                    dofs_state=dofs_state,
+                    entities_info=entities_info,
+                    rigid_global_info=rigid_global_info,
+                    constraint_state=constraint_state,
+                    static_rigid_sim_config=static_rigid_sim_config,
+                )
+
+                # Update descent direction
+                func_terminate_or_update_descent_batch(
+                    i_b,
+                    constraint_state=constraint_state,
+                    rigid_global_info=rigid_global_info,
+                    static_rigid_sim_config=static_rigid_sim_config,
+                )
+        else:
+            constraint_state.improved[i_b] = False
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def kernel_check_convergence_parallel(
+    constraint_state: array_class.ConstraintState,
+    _B: ti.i32,
+) -> ti.i32:
+    """Check if all batches have converged (improved[i_b] == False for all)."""
+    any_improved = 0
+    for i_b in range(_B):
+        if constraint_state.improved[i_b]:
+            any_improved = 1
+    return any_improved
 
 
 # =====================================================================================================================

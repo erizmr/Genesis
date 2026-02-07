@@ -224,6 +224,9 @@ class StructConstraintState(metaclass=BASE_METACLASS):
     eq_sum: V_ANNOTATION
     ls_it: V_ANNOTATION
     ls_result: V_ANNOTATION
+    # Parallel linesearch buffers
+    ls_accum: V_ANNOTATION  # Atomic accumulator for parallel constraint reduction
+    ls_state: V_ANNOTATION  # Per-batch linesearch state (phase, alpha, cost, derivs, etc.)
     # Optional CG fields
     cg_prev_grad: V_ANNOTATION
     cg_prev_Mgrad: V_ANNOTATION
@@ -297,6 +300,8 @@ def get_constraint_state(constraint_solver, solver):
         quad_gauss=V(dtype=gs.ti_float, shape=(3, _B)),
         candidates=V(dtype=gs.ti_float, shape=(12, _B)),
         eq_sum=V(dtype=gs.ti_float, shape=(3, _B)),
+        ls_accum=V(dtype=gs.ti_float, shape=(3, _B)),
+        ls_state=V(dtype=gs.ti_float, shape=(20, _B)),  # Linesearch state for parallel version
         Ma=V(dtype=gs.ti_float, shape=(solver.n_dofs_, _B)),
         Ma_ws=V(dtype=gs.ti_float, shape=(solver.n_dofs_, _B)),
         grad=V(dtype=gs.ti_float, shape=(solver.n_dofs_, _B)),
