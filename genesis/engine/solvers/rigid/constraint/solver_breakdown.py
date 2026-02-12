@@ -33,22 +33,73 @@ def _kernel_linesearch(
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_ls_init(
+def _kernel_parallel_ls_mv(
     entities_info: array_class.EntitiesInfo,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: ti.template(),
+):
+    """Compute mv = M @ search, parallelized over (entity, env)."""
+    n_entities = entities_info.dof_start.shape[0]
+    _B = constraint_state.grad.shape[1]
+
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_e, i_b in ti.ndrange(n_entities, _B):
+        if constraint_state.n_constraints[i_b] > 0:
+            for i_d1 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                mv = gs.ti_float(0.0)
+                for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                    mv = mv + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * constraint_state.search[i_d2, i_b]
+                constraint_state.mv[i_d1, i_b] = mv
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def _kernel_parallel_ls_jv(
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: ti.template(),
+):
+    """Compute jv = J @ search, parallelized over (constraint, env)."""
+    n_dofs = constraint_state.search.shape[0]
+    len_constraints = constraint_state.jac.shape[0]
+    _B = constraint_state.grad.shape[1]
+
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_c, i_b in ti.ndrange(len_constraints, _B):
+        if i_c < constraint_state.n_constraints[i_b]:
+            jv = gs.ti_float(0.0)
+            if ti.static(static_rigid_sim_config.sparse_solve):
+                for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
+                    i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+                    jv = jv + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+            else:
+                for i_d in range(n_dofs):
+                    jv = jv + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+            constraint_state.jv[i_c, i_b] = jv
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def _kernel_parallel_ls_p0(
     dofs_state: array_class.DofsState,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: ti.template(),
 ):
-    """Compute mv, jv, quad_gauss, p0_cost for each env. One thread per env."""
+    """Snorm check, quad_gauss, eq_sum, and p0_cost. One thread per env.
+
+    Assumes mv and jv have already been computed by _kernel_parallel_ls_mv/jv.
+    Computes quad coefficients on the fly (no writes to quad array) to save bandwidth.
+    """
     _B = constraint_state.grad.shape[1]
 
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
     for i_b in range(_B):
         if constraint_state.n_constraints[i_b] > 0:
             n_dofs = constraint_state.search.shape[0]
+            ne = constraint_state.n_constraints_equality[i_b]
+            nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+            n_con = constraint_state.n_constraints[i_b]
 
-            # Use adaptive linesearch tolerance (same as func_linesearch_batch)
+            # snorm convergence check
             snorm = gs.ti_float(0.0)
             for jd in range(n_dofs):
                 snorm = snorm + constraint_state.search[jd, i_b] ** 2
@@ -60,16 +111,73 @@ def _kernel_parallel_ls_init(
                 constraint_state.improved[i_b] = False
             else:
                 constraint_state.improved[i_b] = True
-                # Reuse existing fused init+p0 eval
-                _, p0_cost, _, _ = solver.func_ls_init_and_eval_p0_opt(
-                    i_b,
-                    entities_info=entities_info,
-                    dofs_state=dofs_state,
-                    constraint_state=constraint_state,
-                    rigid_global_info=rigid_global_info,
-                    static_rigid_sim_config=static_rigid_sim_config,
-                )
-                constraint_state.candidates[1, i_b] = p0_cost
+
+                # quad_gauss (mv already computed)
+                quad_gauss_1 = gs.ti_float(0.0)
+                quad_gauss_2 = gs.ti_float(0.0)
+                for i_d in range(n_dofs):
+                    quad_gauss_1 = quad_gauss_1 + (
+                        constraint_state.search[i_d, i_b] * constraint_state.Ma[i_d, i_b]
+                        - constraint_state.search[i_d, i_b] * dofs_state.force[i_d, i_b]
+                    )
+                    quad_gauss_2 = (
+                        quad_gauss_2 + 0.5 * constraint_state.search[i_d, i_b] * constraint_state.mv[i_d, i_b]
+                    )
+                constraint_state.quad_gauss[0, i_b] = constraint_state.gauss[i_b]
+                constraint_state.quad_gauss[1, i_b] = quad_gauss_1
+                constraint_state.quad_gauss[2, i_b] = quad_gauss_2
+
+                # Accumulate p0 cost by constraint type (compute quad on the fly)
+                tmp_0 = constraint_state.gauss[i_b]
+                tmp_1 = quad_gauss_1
+                tmp_2 = quad_gauss_2
+                eq_sum_0 = gs.ti_float(0.0)
+                eq_sum_1 = gs.ti_float(0.0)
+                eq_sum_2 = gs.ti_float(0.0)
+
+                for i_c in range(n_con):
+                    Jaref_c = constraint_state.Jaref[i_c, i_b]
+                    jv_c = constraint_state.jv[i_c, i_b]
+                    D = constraint_state.efc_D[i_c, i_b]
+                    qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+                    qf_1 = D * (jv_c * Jaref_c)
+                    qf_2 = D * (0.5 * jv_c * jv_c)
+
+                    if i_c < ne:
+                        # Equality: always active
+                        eq_sum_0 = eq_sum_0 + qf_0
+                        eq_sum_1 = eq_sum_1 + qf_1
+                        eq_sum_2 = eq_sum_2 + qf_2
+                        tmp_0 = tmp_0 + qf_0
+                        tmp_1 = tmp_1 + qf_1
+                        tmp_2 = tmp_2 + qf_2
+                    elif i_c < nef:
+                        # Friction: check linear regime at x=Jaref (alpha=0)
+                        f = constraint_state.efc_frictionloss[i_c, i_b]
+                        r = constraint_state.diag[i_c, i_b]
+                        rf = r * f
+                        linear_neg = Jaref_c <= -rf
+                        linear_pos = Jaref_c >= rf
+                        if linear_neg or linear_pos:
+                            qf_0 = linear_neg * f * (-0.5 * rf - Jaref_c) + linear_pos * f * (-0.5 * rf + Jaref_c)
+                            qf_1 = linear_neg * (-f * jv_c) + linear_pos * (f * jv_c)
+                            qf_2 = 0.0
+                        tmp_0 = tmp_0 + qf_0
+                        tmp_1 = tmp_1 + qf_1
+                        tmp_2 = tmp_2 + qf_2
+                    else:
+                        # Contact: active if Jaref < 0
+                        active = Jaref_c < 0
+                        tmp_0 = tmp_0 + qf_0 * active
+                        tmp_1 = tmp_1 + qf_1 * active
+                        tmp_2 = tmp_2 + qf_2 * active
+
+                constraint_state.eq_sum[0, i_b] = eq_sum_0
+                constraint_state.eq_sum[1, i_b] = eq_sum_1
+                constraint_state.eq_sum[2, i_b] = eq_sum_2
+
+                constraint_state.ls_it[i_b] = 1
+                constraint_state.candidates[1, i_b] = tmp_0
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
@@ -326,8 +434,17 @@ def func_solve_decomposed_macrokernels(
     iterations = rigid_global_info.iterations[None]
     for _it in range(iterations):
         if use_parallel_ls:
-            _kernel_parallel_ls_init(
+            _kernel_parallel_ls_mv(
                 entities_info,
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
+            _kernel_parallel_ls_jv(
+                constraint_state,
+                static_rigid_sim_config,
+            )
+            _kernel_parallel_ls_p0(
                 dofs_state,
                 constraint_state,
                 rigid_global_info,
