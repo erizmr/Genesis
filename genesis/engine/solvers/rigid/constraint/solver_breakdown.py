@@ -34,23 +34,30 @@ def _kernel_linesearch(
 
 @ti.kernel(fastcache=gs.use_fastcache)
 def _kernel_parallel_linesearch_mv(
+    dofs_info: array_class.DofsInfo,
     entities_info: array_class.EntitiesInfo,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: ti.template(),
 ):
-    """Compute mv = M @ search, parallelized over (entity, env)."""
-    n_entities = entities_info.dof_start.shape[0]
+    """Compute mv = M @ search, parallelized over (dof, env).
+
+    Uses per-dof entity lookup to find the entity block boundaries, giving n_dofs * B
+    threads (each computing a single ~6-element dot product) instead of n_entities * B
+    threads (each computing the full block matvec).
+    """
+    n_dofs = constraint_state.search.shape[0]
     _B = constraint_state.grad.shape[1]
 
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_e, i_b in ti.ndrange(n_entities, _B):
+    for i_d1, i_b in ti.ndrange(n_dofs, _B):
         if constraint_state.n_constraints[i_b] > 0:
-            for i_d1 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
-                mv = gs.ti_float(0.0)
-                for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
-                    mv = mv + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * constraint_state.search[i_d2, i_b]
-                constraint_state.mv[i_d1, i_b] = mv
+            I_d1 = [i_d1, i_b] if ti.static(static_rigid_sim_config.batch_dofs_info) else i_d1
+            i_e = dofs_info.entity_idx[I_d1]
+            mv = gs.ti_float(0.0)
+            for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                mv = mv + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * constraint_state.search[i_d2, i_b]
+            constraint_state.mv[i_d1, i_b] = mv
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
@@ -419,6 +426,7 @@ def _kernel_update_search_direction(
 
 def func_solve_decomposed_macrokernels(
     entities_info,
+    dofs_info,
     dofs_state,
     constraint_state,
     rigid_global_info,
@@ -435,6 +443,7 @@ def func_solve_decomposed_macrokernels(
     for _it in range(iterations):
         if use_parallel_ls:
             _kernel_parallel_linesearch_mv(
+                dofs_info,
                 entities_info,
                 constraint_state,
                 rigid_global_info,

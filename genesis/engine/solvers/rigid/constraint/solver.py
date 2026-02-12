@@ -211,6 +211,7 @@ class ConstraintSolver:
 
             func_solve_decomposed_macrokernels(
                 self._solver.entities_info,
+                self._solver.dofs_info,
                 self._solver.dofs_state,
                 self.constraint_state,
                 self._solver._rigid_global_info,
