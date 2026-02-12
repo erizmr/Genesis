@@ -33,7 +33,7 @@ def _kernel_linesearch(
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_ls_mv(
+def _kernel_parallel_linesearch_mv(
     entities_info: array_class.EntitiesInfo,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
@@ -54,7 +54,7 @@ def _kernel_parallel_ls_mv(
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_ls_jv(
+def _kernel_parallel_linesearch_jv(
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: ti.template(),
 ):
@@ -78,7 +78,7 @@ def _kernel_parallel_ls_jv(
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_ls_p0(
+def _kernel_parallel_linesearch_p0(
     dofs_state: array_class.DofsState,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
@@ -181,7 +181,7 @@ def _kernel_parallel_ls_p0(
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_ls_eval(
+def _kernel_parallel_linesearch_eval(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: ti.template(),
@@ -283,7 +283,7 @@ def _kernel_parallel_ls_eval(
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_ls_apply_alpha(
+def _kernel_parallel_linesearch_apply_alpha(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: ti.template(),
@@ -434,28 +434,28 @@ def func_solve_decomposed_macrokernels(
     iterations = rigid_global_info.iterations[None]
     for _it in range(iterations):
         if use_parallel_ls:
-            _kernel_parallel_ls_mv(
+            _kernel_parallel_linesearch_mv(
                 entities_info,
                 constraint_state,
                 rigid_global_info,
                 static_rigid_sim_config,
             )
-            _kernel_parallel_ls_jv(
+            _kernel_parallel_linesearch_jv(
                 constraint_state,
                 static_rigid_sim_config,
             )
-            _kernel_parallel_ls_p0(
+            _kernel_parallel_linesearch_p0(
                 dofs_state,
                 constraint_state,
                 rigid_global_info,
                 static_rigid_sim_config,
             )
-            _kernel_parallel_ls_eval(
+            _kernel_parallel_linesearch_eval(
                 constraint_state,
                 rigid_global_info,
                 static_rigid_sim_config,
             )
-            _kernel_parallel_ls_apply_alpha(
+            _kernel_parallel_linesearch_apply_alpha(
                 constraint_state,
                 rigid_global_info,
                 static_rigid_sim_config,
