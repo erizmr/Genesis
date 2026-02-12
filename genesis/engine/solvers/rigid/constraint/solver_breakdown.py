@@ -4,6 +4,9 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 from genesis.engine.solvers.rigid.constraint import solver
 
+LS_PARALLEL_K = 8
+LS_PARALLEL_MIN_STEP = 1e-6
+
 
 @ti.kernel(fastcache=gs.use_fastcache)
 def _kernel_linesearch(
@@ -27,6 +30,180 @@ def _kernel_linesearch(
             )
         else:
             constraint_state.improved[i_b] = False
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def _kernel_parallel_ls_init(
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: ti.template(),
+):
+    """Compute mv, jv, quad_gauss, p0_cost for each env. One thread per env."""
+    _B = constraint_state.grad.shape[1]
+
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0:
+            n_dofs = constraint_state.search.shape[0]
+
+            # Use adaptive linesearch tolerance (same as func_linesearch_batch)
+            snorm = gs.ti_float(0.0)
+            for jd in range(n_dofs):
+                snorm = snorm + constraint_state.search[jd, i_b] ** 2
+            snorm = ti.sqrt(snorm)
+
+            if snorm < rigid_global_info.EPS[None]:
+                constraint_state.candidates[0, i_b] = 0.0
+                constraint_state.candidates[1, i_b] = 0.0
+                constraint_state.improved[i_b] = False
+            else:
+                constraint_state.improved[i_b] = True
+                # Reuse existing fused init+p0 eval
+                _, p0_cost, _, _ = solver.func_ls_init_and_eval_p0_opt(
+                    i_b,
+                    entities_info=entities_info,
+                    dofs_state=dofs_state,
+                    constraint_state=constraint_state,
+                    rigid_global_info=rigid_global_info,
+                    static_rigid_sim_config=static_rigid_sim_config,
+                )
+                constraint_state.candidates[1, i_b] = p0_cost
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def _kernel_parallel_ls_eval(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: ti.template(),
+):
+    """Evaluate K candidate alphas in parallel per env, pick the best via reduction."""
+    _B = constraint_state.grad.shape[1]
+    _K = ti.static(LS_PARALLEL_K)
+    _MIN_STEP = ti.static(LS_PARALLEL_MIN_STEP)
+
+    ti.loop_config(block_dim=_K)
+    for i_ in range(_B * _K):
+        tid = i_ % _K
+        i_b = i_ // _K
+
+        # Shared memory for argmin reduction
+        sh_cost = ti.simt.block.SharedArray((_K,), gs.ti_float)
+        sh_idx = ti.simt.block.SharedArray((_K,), ti.i32)
+
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            ne = constraint_state.n_constraints_equality[i_b]
+            nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+            n_con = constraint_state.n_constraints[i_b]
+
+            # Generate log-spaced alpha: alpha[0]=MIN_STEP ... alpha[K-1]=1.0
+            alpha = solver._log_scale(_MIN_STEP, 1.0, _K, tid)
+
+            # Evaluate cost at this alpha
+            cost = (
+                alpha * alpha * constraint_state.quad_gauss[2, i_b]
+                + alpha * constraint_state.quad_gauss[1, i_b]
+                + constraint_state.quad_gauss[0, i_b]
+            )
+
+            # Equality constraints (always active) - use eq_sum precomputed during init
+            cost = (
+                cost
+                + alpha * alpha * constraint_state.eq_sum[2, i_b]
+                + alpha * constraint_state.eq_sum[1, i_b]
+                + constraint_state.eq_sum[0, i_b]
+            )
+
+            # Friction constraints
+            for i_c in range(ne, nef):
+                Jaref_c = constraint_state.Jaref[i_c, i_b]
+                jv_c = constraint_state.jv[i_c, i_b]
+                D = constraint_state.efc_D[i_c, i_b]
+                f = constraint_state.efc_frictionloss[i_c, i_b]
+                r = constraint_state.diag[i_c, i_b]
+                x = Jaref_c + alpha * jv_c
+                rf = r * f
+                linear_neg = x <= -rf
+                linear_pos = x >= rf
+                if linear_neg or linear_pos:
+                    cost = cost + linear_neg * f * (-0.5 * rf - Jaref_c - alpha * jv_c)
+                    cost = cost + linear_pos * f * (-0.5 * rf + Jaref_c + alpha * jv_c)
+                else:
+                    cost = cost + D * 0.5 * x * x
+
+            # Contact constraints (active if x < 0)
+            for i_c in range(nef, n_con):
+                Jaref_c = constraint_state.Jaref[i_c, i_b]
+                jv_c = constraint_state.jv[i_c, i_b]
+                D = constraint_state.efc_D[i_c, i_b]
+                x = Jaref_c + alpha * jv_c
+                if x < 0:
+                    cost += D * 0.5 * x * x
+
+            sh_cost[tid] = cost
+            sh_idx[tid] = tid
+        else:
+            sh_cost[tid] = gs.ti_float(1e30)
+            sh_idx[tid] = tid
+
+        ti.simt.block.sync()
+
+        # Tree reduction for argmin
+        stride = _K // 2
+        while stride > 0:
+            if tid < stride:
+                if sh_cost[tid + stride] < sh_cost[tid]:
+                    sh_cost[tid] = sh_cost[tid + stride]
+                    sh_idx[tid] = sh_idx[tid + stride]
+            ti.simt.block.sync()
+            stride = stride // 2
+
+        # Thread 0: acceptance check and write result
+        if tid == 0:
+            if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+                p0_cost = constraint_state.candidates[1, i_b]
+                best_tid = sh_idx[0]
+                best_cost = sh_cost[0]
+                best_alpha = solver._log_scale(_MIN_STEP, 1.0, _K, best_tid)
+                if best_cost < p0_cost:
+                    constraint_state.candidates[0, i_b] = best_alpha
+                else:
+                    constraint_state.candidates[0, i_b] = 0.0
+            else:
+                constraint_state.candidates[0, i_b] = 0.0
+
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def _kernel_parallel_ls_apply_alpha(
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: ti.template(),
+):
+    """Apply the best alpha found by _kernel_parallel_ls_eval. One thread per env."""
+    _B = constraint_state.grad.shape[1]
+    n_dofs = constraint_state.qacc.shape[0]
+
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            alpha = constraint_state.candidates[0, i_b]
+
+            if ti.abs(alpha) < rigid_global_info.EPS[None]:
+                constraint_state.improved[i_b] = False
+            else:
+                for i_d in range(n_dofs):
+                    constraint_state.qacc[i_d, i_b] = (
+                        constraint_state.qacc[i_d, i_b] + constraint_state.search[i_d, i_b] * alpha
+                    )
+                    constraint_state.Ma[i_d, i_b] = (
+                        constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
+                    )
+
+                for i_c in range(constraint_state.n_constraints[i_b]):
+                    constraint_state.Jaref[i_c, i_b] = (
+                        constraint_state.Jaref[i_c, i_b] + constraint_state.jv[i_c, i_b] * alpha
+                    )
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
@@ -138,6 +315,7 @@ def func_solve_decomposed_macrokernels(
     constraint_state,
     rigid_global_info,
     static_rigid_sim_config,
+    use_parallel_ls=False,
 ):
     """
     Uses separate kernels for each solver step per iteration.
@@ -147,13 +325,32 @@ def func_solve_decomposed_macrokernels(
     """
     iterations = rigid_global_info.iterations[None]
     for _it in range(iterations):
-        _kernel_linesearch(
-            entities_info,
-            dofs_state,
-            constraint_state,
-            rigid_global_info,
-            static_rigid_sim_config,
-        )
+        if use_parallel_ls:
+            _kernel_parallel_ls_init(
+                entities_info,
+                dofs_state,
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
+            _kernel_parallel_ls_eval(
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
+            _kernel_parallel_ls_apply_alpha(
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
+        else:
+            _kernel_linesearch(
+                entities_info,
+                dofs_state,
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
         if static_rigid_sim_config.solver_type == gs.constraint_solver.CG:
             _kernel_cg_only_save_prev_grad(
                 constraint_state,

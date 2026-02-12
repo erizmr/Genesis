@@ -26,6 +26,7 @@ USE_LS_OPT = 1
 IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
 
 GS_SOLVER_DECOMPOSE = "GS_SOLVER_DECOMPOSE"
+USE_LS_PARALLEL = os.environ.get("GS_SOLVER_LS_PARALLEL", "0") == "1"
 
 
 class ConstraintSolver:
@@ -191,6 +192,8 @@ class ConstraintSolver:
         use_decomposed_kernels = gs.backend != gs.cpu
         if GS_SOLVER_DECOMPOSE in os.environ:
             use_decomposed_kernels = os.environ.get("GS_SOLVER_DECOMPOSE", "0") == "1"
+        # TODO: debug use, set always true
+        use_decomposed_kernels = 1
 
         func_solve_init(
             self._solver.dofs_info,
@@ -212,6 +215,7 @@ class ConstraintSolver:
                 self.constraint_state,
                 self._solver._rigid_global_info,
                 self._solver._static_rigid_sim_config,
+                use_parallel_ls=USE_LS_PARALLEL and gs.backend == gs.gpu,
             )
         else:
             func_solve_body(
@@ -2558,6 +2562,12 @@ def update_bracket(
             i_b, p_alpha - p_deriv_0 / p_deriv_1, constraint_state, rigid_global_info
         )
     return flag, p_alpha, p_cost, p_deriv_0, p_deriv_1, p_next_alpha, p_next_cost, p_next_deriv_0, p_next_deriv_1
+
+
+@ti.func
+def _log_scale(min_value: gs.ti_float, max_value: gs.ti_float, num_values: ti.i32, i: ti.i32) -> gs.ti_float:
+    step = (ti.log(max_value) - ti.log(min_value)) / ti.max(1.0, gs.ti_float(num_values - 1))
+    return ti.exp(ti.log(min_value) + gs.ti_float(i) * step)
 
 
 @ti.func
