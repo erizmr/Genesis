@@ -27,6 +27,8 @@ IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
 
 GS_SOLVER_DECOMPOSE = "GS_SOLVER_DECOMPOSE"
 USE_LS_PARALLEL = os.environ.get("GS_SOLVER_LS_PARALLEL", "0") == "1"
+# TODO: set default for debug
+USE_LS_PARALLEL = 1
 
 
 class ConstraintSolver:
@@ -216,7 +218,7 @@ class ConstraintSolver:
                 self.constraint_state,
                 self._solver._rigid_global_info,
                 self._solver._static_rigid_sim_config,
-                use_parallel_ls=USE_LS_PARALLEL and gs.backend == gs.gpu,
+                use_parallel_ls=USE_LS_PARALLEL and gs.backend == gs.cuda,
             )
         else:
             func_solve_body(
