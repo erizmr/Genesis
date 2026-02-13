@@ -6,6 +6,7 @@ from genesis.engine.solvers.rigid.constraint import solver
 
 LS_PARALLEL_K = 8
 LS_PARALLEL_MIN_STEP = 1e-6
+_P0_BLOCK = 32
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
@@ -91,75 +92,101 @@ def _kernel_parallel_linesearch_p0(
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: ti.template(),
 ):
-    """Snorm check, quad_gauss, eq_sum, and p0_cost. One thread per env.
+    """Snorm check, quad_gauss, eq_sum, and p0_cost. T threads per env with shared memory reductions.
 
-    Assumes mv and jv have already been computed by _kernel_parallel_ls_mv/jv.
-    Computes quad coefficients on the fly (no writes to quad array) to save bandwidth.
+    Phase 1: Fused snorm + quad_gauss parallel reduction over n_dofs (Options A+B).
+    Phase 2: Parallel reduction over n_constraints for eq_sum and p0_cost.
     """
     _B = constraint_state.grad.shape[1]
+    _T = ti.static(_P0_BLOCK)
 
-    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
-    for i_b in range(_B):
+    ti.loop_config(block_dim=_T)
+    for i_ in range(_B * _T):
+        tid = i_ % _T
+        i_b = i_ // _T
+
+        # 4 shared arrays for parallel reductions (reused across phases)
+        sh_a = ti.simt.block.SharedArray((_T,), gs.ti_float)
+        sh_b = ti.simt.block.SharedArray((_T,), gs.ti_float)
+        sh_c = ti.simt.block.SharedArray((_T,), gs.ti_float)
+        sh_d = ti.simt.block.SharedArray((_T,), gs.ti_float)
+
         if constraint_state.n_constraints[i_b] > 0:
             n_dofs = constraint_state.search.shape[0]
-            ne = constraint_state.n_constraints_equality[i_b]
-            nef = ne + constraint_state.n_constraints_frictionloss[i_b]
-            n_con = constraint_state.n_constraints[i_b]
 
-            # snorm convergence check
-            snorm = gs.ti_float(0.0)
-            for jd in range(n_dofs):
-                snorm = snorm + constraint_state.search[jd, i_b] ** 2
-            snorm = ti.sqrt(snorm)
+            # === Phase 1: Fused snorm + quad_gauss, parallel over n_dofs ===
+            local_snorm_sq = gs.ti_float(0.0)
+            local_qg1 = gs.ti_float(0.0)
+            local_qg2 = gs.ti_float(0.0)
+
+            i_d = tid
+            while i_d < n_dofs:
+                s = constraint_state.search[i_d, i_b]
+                local_snorm_sq += s * s
+                local_qg1 += s * constraint_state.Ma[i_d, i_b] - s * dofs_state.force[i_d, i_b]
+                local_qg2 += 0.5 * s * constraint_state.mv[i_d, i_b]
+                i_d += _T
+
+            sh_a[tid] = local_snorm_sq
+            sh_b[tid] = local_qg1
+            sh_c[tid] = local_qg2
+
+            ti.simt.block.sync()
+
+            # Tree reduction for 3 accumulators
+            stride = _T // 2
+            while stride > 0:
+                if tid < stride:
+                    sh_a[tid] += sh_a[tid + stride]
+                    sh_b[tid] += sh_b[tid + stride]
+                    sh_c[tid] += sh_c[tid + stride]
+                ti.simt.block.sync()
+                stride //= 2
+
+            # All threads read the reduced snorm
+            snorm = ti.sqrt(sh_a[0])
 
             if snorm < rigid_global_info.EPS[None]:
-                constraint_state.candidates[0, i_b] = 0.0
-                constraint_state.candidates[1, i_b] = 0.0
-                constraint_state.improved[i_b] = False
+                # Converged — only thread 0 writes
+                if tid == 0:
+                    constraint_state.candidates[0, i_b] = 0.0
+                    constraint_state.candidates[1, i_b] = 0.0
+                    constraint_state.improved[i_b] = False
             else:
-                constraint_state.improved[i_b] = True
+                # Thread 0 writes quad_gauss to global memory
+                if tid == 0:
+                    constraint_state.improved[i_b] = True
+                    constraint_state.quad_gauss[0, i_b] = constraint_state.gauss[i_b]
+                    constraint_state.quad_gauss[1, i_b] = sh_b[0]
+                    constraint_state.quad_gauss[2, i_b] = sh_c[0]
 
-                # quad_gauss (mv already computed)
-                quad_gauss_1 = gs.ti_float(0.0)
-                quad_gauss_2 = gs.ti_float(0.0)
-                for i_d in range(n_dofs):
-                    quad_gauss_1 = quad_gauss_1 + (
-                        constraint_state.search[i_d, i_b] * constraint_state.Ma[i_d, i_b]
-                        - constraint_state.search[i_d, i_b] * dofs_state.force[i_d, i_b]
-                    )
-                    quad_gauss_2 = (
-                        quad_gauss_2 + 0.5 * constraint_state.search[i_d, i_b] * constraint_state.mv[i_d, i_b]
-                    )
-                constraint_state.quad_gauss[0, i_b] = constraint_state.gauss[i_b]
-                constraint_state.quad_gauss[1, i_b] = quad_gauss_1
-                constraint_state.quad_gauss[2, i_b] = quad_gauss_2
+                # === Phase 2: Constraint cost, parallel over n_constraints ===
+                ne = constraint_state.n_constraints_equality[i_b]
+                nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+                n_con = constraint_state.n_constraints[i_b]
 
-                # Accumulate p0 cost by constraint type (compute quad on the fly)
-                tmp_0 = constraint_state.gauss[i_b]
-                tmp_1 = quad_gauss_1
-                tmp_2 = quad_gauss_2
-                eq_sum_0 = gs.ti_float(0.0)
-                eq_sum_1 = gs.ti_float(0.0)
-                eq_sum_2 = gs.ti_float(0.0)
+                local_eq0 = gs.ti_float(0.0)
+                local_eq1 = gs.ti_float(0.0)
+                local_eq2 = gs.ti_float(0.0)
+                local_tmp0 = gs.ti_float(0.0)
 
-                for i_c in range(n_con):
+                i_c = tid
+                while i_c < n_con:
                     Jaref_c = constraint_state.Jaref[i_c, i_b]
-                    jv_c = constraint_state.jv[i_c, i_b]
                     D = constraint_state.efc_D[i_c, i_b]
                     qf_0 = D * (0.5 * Jaref_c * Jaref_c)
-                    qf_1 = D * (jv_c * Jaref_c)
-                    qf_2 = D * (0.5 * jv_c * jv_c)
 
                     if i_c < ne:
-                        # Equality: always active
-                        eq_sum_0 = eq_sum_0 + qf_0
-                        eq_sum_1 = eq_sum_1 + qf_1
-                        eq_sum_2 = eq_sum_2 + qf_2
-                        tmp_0 = tmp_0 + qf_0
-                        tmp_1 = tmp_1 + qf_1
-                        tmp_2 = tmp_2 + qf_2
+                        # Equality: always active, need jv for eq_sum
+                        jv_c = constraint_state.jv[i_c, i_b]
+                        qf_1 = D * (jv_c * Jaref_c)
+                        qf_2 = D * (0.5 * jv_c * jv_c)
+                        local_eq0 += qf_0
+                        local_eq1 += qf_1
+                        local_eq2 += qf_2
+                        local_tmp0 += qf_0
                     elif i_c < nef:
-                        # Friction: check linear regime at x=Jaref (alpha=0)
+                        # Friction: only qf_0 needed (qf_1/qf_2 not stored)
                         f = constraint_state.efc_frictionloss[i_c, i_b]
                         r = constraint_state.diag[i_c, i_b]
                         rf = r * f
@@ -167,24 +194,39 @@ def _kernel_parallel_linesearch_p0(
                         linear_pos = Jaref_c >= rf
                         if linear_neg or linear_pos:
                             qf_0 = linear_neg * f * (-0.5 * rf - Jaref_c) + linear_pos * f * (-0.5 * rf + Jaref_c)
-                            qf_1 = linear_neg * (-f * jv_c) + linear_pos * (f * jv_c)
-                            qf_2 = 0.0
-                        tmp_0 = tmp_0 + qf_0
-                        tmp_1 = tmp_1 + qf_1
-                        tmp_2 = tmp_2 + qf_2
+                        local_tmp0 += qf_0
                     else:
                         # Contact: active if Jaref < 0
                         active = Jaref_c < 0
-                        tmp_0 = tmp_0 + qf_0 * active
-                        tmp_1 = tmp_1 + qf_1 * active
-                        tmp_2 = tmp_2 + qf_2 * active
+                        local_tmp0 += qf_0 * active
 
-                constraint_state.eq_sum[0, i_b] = eq_sum_0
-                constraint_state.eq_sum[1, i_b] = eq_sum_1
-                constraint_state.eq_sum[2, i_b] = eq_sum_2
+                    i_c += _T
 
-                constraint_state.ls_it[i_b] = 1
-                constraint_state.candidates[1, i_b] = tmp_0
+                # Reuse shared arrays for Phase 2 reduction
+                sh_a[tid] = local_eq0
+                sh_b[tid] = local_eq1
+                sh_c[tid] = local_eq2
+                sh_d[tid] = local_tmp0
+
+                ti.simt.block.sync()
+
+                # Tree reduction for 4 accumulators
+                stride = _T // 2
+                while stride > 0:
+                    if tid < stride:
+                        sh_a[tid] += sh_a[tid + stride]
+                        sh_b[tid] += sh_b[tid + stride]
+                        sh_c[tid] += sh_c[tid + stride]
+                        sh_d[tid] += sh_d[tid + stride]
+                    ti.simt.block.sync()
+                    stride //= 2
+
+                if tid == 0:
+                    constraint_state.eq_sum[0, i_b] = sh_a[0]
+                    constraint_state.eq_sum[1, i_b] = sh_b[0]
+                    constraint_state.eq_sum[2, i_b] = sh_c[0]
+                    constraint_state.ls_it[i_b] = 1
+                    constraint_state.candidates[1, i_b] = constraint_state.gauss[i_b] + sh_d[0]
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
