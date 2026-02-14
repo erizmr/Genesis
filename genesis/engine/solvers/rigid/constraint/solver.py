@@ -197,14 +197,32 @@ class ConstraintSolver:
         # TODO: debug use, set always true
         use_decomposed_kernels = 1
 
-        func_solve_init(
-            self._solver.dofs_info,
-            self._solver.dofs_state,
-            self._solver.entities_info,
-            self.constraint_state,
-            self._solver._rigid_global_info,
-            self._solver._static_rigid_sim_config,
+        use_decomposed_init = (
+            USE_LS_PARALLEL and gs.backend == gs.cuda and not self._solver._enable_mujoco_compatibility
         )
+
+        if use_decomposed_init:
+            from genesis.engine.solvers.rigid.constraint.solver_breakdown import (
+                func_solve_init_decomposed,
+            )
+
+            func_solve_init_decomposed(
+                self._solver.dofs_info,
+                self._solver.dofs_state,
+                self._solver.entities_info,
+                self.constraint_state,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+            )
+        else:
+            func_solve_init(
+                self._solver.dofs_info,
+                self._solver.dofs_state,
+                self._solver.entities_info,
+                self.constraint_state,
+                self._solver._rigid_global_info,
+                self._solver._static_rigid_sim_config,
+            )
 
         if use_decomposed_kernels:
             from genesis.engine.solvers.rigid.constraint.solver_breakdown import (
