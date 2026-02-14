@@ -69,6 +69,7 @@ def _kernel_parallel_linesearch_jv(
 ):
     """Compute jv = J @ search. T threads per env, search loaded into shared memory."""
     n_dofs = constraint_state.search.shape[0]
+    _SHMEM_N_DOFS = ti.static(static_rigid_sim_config.tiled_n_dofs)
     _B = constraint_state.grad.shape[1]
     _T = ti.static(_JV_BLOCK)
 
@@ -78,7 +79,7 @@ def _kernel_parallel_linesearch_jv(
         i_b = i_ // _T
 
         # Shared memory: load search once per block instead of once per constraint
-        sh_search = ti.simt.block.SharedArray((n_dofs,), gs.ti_float)
+        sh_search = ti.simt.block.SharedArray((_SHMEM_N_DOFS,), gs.ti_float)
 
         if constraint_state.n_constraints[i_b] > 0:
             # Cooperatively load search into shared memory
@@ -96,11 +97,11 @@ def _kernel_parallel_linesearch_jv(
                 jv = gs.ti_float(0.0)
                 if ti.static(static_rigid_sim_config.sparse_solve):
                     for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
-                        i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
-                        jv += constraint_state.jac[i_c, i_d, i_b] * sh_search[i_d]
+                        i_dd = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+                        jv += constraint_state.jac[i_c, i_dd, i_b] * sh_search[i_dd]
                 else:
-                    for i_d in range(n_dofs):
-                        jv += constraint_state.jac[i_c, i_d, i_b] * sh_search[i_d]
+                    for i_dd in range(n_dofs):
+                        jv += constraint_state.jac[i_c, i_dd, i_b] * sh_search[i_dd]
                 constraint_state.jv[i_c, i_b] = jv
                 i_c += _T
 
