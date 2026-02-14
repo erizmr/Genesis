@@ -332,35 +332,41 @@ def _kernel_parallel_linesearch_eval(
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_linesearch_apply_alpha(
+def _kernel_parallel_linesearch_apply_alpha_dofs(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: ti.template(),
 ):
-    """Apply the best alpha found by _kernel_parallel_ls_eval. One thread per env."""
-    _B = constraint_state.grad.shape[1]
+    """Apply best alpha to qacc and Ma, parallelized over (dof, env)."""
     n_dofs = constraint_state.qacc.shape[0]
+    _B = constraint_state.grad.shape[1]
 
-    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
-    for i_b in range(_B):
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_d, i_b in ti.ndrange(n_dofs, _B):
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             alpha = constraint_state.candidates[0, i_b]
-
             if ti.abs(alpha) < rigid_global_info.EPS[None]:
-                constraint_state.improved[i_b] = False
+                if i_d == 0:
+                    constraint_state.improved[i_b] = False
             else:
-                for i_d in range(n_dofs):
-                    constraint_state.qacc[i_d, i_b] = (
-                        constraint_state.qacc[i_d, i_b] + constraint_state.search[i_d, i_b] * alpha
-                    )
-                    constraint_state.Ma[i_d, i_b] = (
-                        constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
-                    )
+                constraint_state.qacc[i_d, i_b] += constraint_state.search[i_d, i_b] * alpha
+                constraint_state.Ma[i_d, i_b] += constraint_state.mv[i_d, i_b] * alpha
 
-                for i_c in range(constraint_state.n_constraints[i_b]):
-                    constraint_state.Jaref[i_c, i_b] = (
-                        constraint_state.Jaref[i_c, i_b] + constraint_state.jv[i_c, i_b] * alpha
-                    )
+
+@ti.kernel(fastcache=gs.use_fastcache)
+def _kernel_parallel_linesearch_apply_alpha_constraints(
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: ti.template(),
+):
+    """Apply best alpha to Jaref, parallelized over (constraint, env)."""
+    len_constraints = constraint_state.Jaref.shape[0]
+    _B = constraint_state.grad.shape[1]
+
+    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_c, i_b in ti.ndrange(len_constraints, _B):
+        if i_c < constraint_state.n_constraints[i_b] and constraint_state.improved[i_b]:
+            alpha = constraint_state.candidates[0, i_b]
+            constraint_state.Jaref[i_c, i_b] += constraint_state.jv[i_c, i_b] * alpha
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
@@ -506,9 +512,13 @@ def func_solve_decomposed_macrokernels(
                 rigid_global_info,
                 static_rigid_sim_config,
             )
-            _kernel_parallel_linesearch_apply_alpha(
+            _kernel_parallel_linesearch_apply_alpha_dofs(
                 constraint_state,
                 rigid_global_info,
+                static_rigid_sim_config,
+            )
+            _kernel_parallel_linesearch_apply_alpha_constraints(
+                constraint_state,
                 static_rigid_sim_config,
             )
         else:
