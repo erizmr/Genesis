@@ -748,23 +748,21 @@ def func_solve_init_decomposed(
     # 4. Set improved flags (needed by decomposed update_constraint kernels)
     _kernel_init_improved(constraint_state, static_rigid_sim_config)
 
-    # 5. Update constraint forces (active, efc_force)
+    # 5. Update constraint (reuse decomposed kernels)
     _kernel_update_constraint_forces(constraint_state, static_rigid_sim_config)
+    _kernel_update_constraint_qfrc(constraint_state, static_rigid_sim_config)
+    _kernel_update_constraint_cost(dofs_state, constraint_state, static_rigid_sim_config)
 
-    # 6. Newton hessian (reads active — placed right after forces for L2 warmth)
+    # 6. Newton hessian (Newton only)
     if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
         _kernel_newton_only_nt_hessian_incremental(
             entities_info, constraint_state, rigid_global_info, static_rigid_sim_config
         )
 
-    # 7. Update constraint qfrc + cost (independent of hessian)
-    _kernel_update_constraint_qfrc(constraint_state, static_rigid_sim_config)
-    _kernel_update_constraint_cost(dofs_state, constraint_state, static_rigid_sim_config)
-
-    # 8. Update gradient (needs both nt_H from hessian and qfrc_constraint from qfrc)
+    # 7. Update gradient
     _kernel_update_gradient(entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config)
 
-    # 9. search = -Mgrad
+    # 8. search = -Mgrad
     _kernel_init_search(constraint_state, static_rigid_sim_config)
 
 
@@ -835,14 +833,6 @@ def func_solve_decomposed_macrokernels(
                 constraint_state,
                 static_rigid_sim_config,
             )
-            # Hessian right after forces: active stays L2-warm, jac warm for qfrc next
-            if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
-                _kernel_newton_only_nt_hessian_incremental(
-                    entities_info,
-                    constraint_state,
-                    rigid_global_info,
-                    static_rigid_sim_config,
-                )
             _kernel_update_constraint_qfrc(
                 constraint_state,
                 static_rigid_sim_config,
@@ -860,13 +850,13 @@ def func_solve_decomposed_macrokernels(
                 rigid_global_info,
                 static_rigid_sim_config,
             )
-            if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
-                _kernel_newton_only_nt_hessian_incremental(
-                    entities_info,
-                    constraint_state,
-                    rigid_global_info,
-                    static_rigid_sim_config,
-                )
+        if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
+            _kernel_newton_only_nt_hessian_incremental(
+                entities_info,
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
         _kernel_update_gradient(
             entities_info,
             dofs_state,
