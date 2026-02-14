@@ -7,6 +7,7 @@ from genesis.engine.solvers.rigid.constraint import solver
 LS_PARALLEL_K = 8
 LS_PARALLEL_MIN_STEP = 1e-6
 _P0_BLOCK = 32
+_JV_BLOCK = 32
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
@@ -66,23 +67,42 @@ def _kernel_parallel_linesearch_jv(
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: ti.template(),
 ):
-    """Compute jv = J @ search, parallelized over (constraint, env)."""
+    """Compute jv = J @ search. T threads per env, search loaded into shared memory."""
     n_dofs = constraint_state.search.shape[0]
-    len_constraints = constraint_state.jac.shape[0]
     _B = constraint_state.grad.shape[1]
+    _T = ti.static(_JV_BLOCK)
 
-    ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_c, i_b in ti.ndrange(len_constraints, _B):
-        if i_c < constraint_state.n_constraints[i_b]:
-            jv = gs.ti_float(0.0)
-            if ti.static(static_rigid_sim_config.sparse_solve):
-                for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
-                    i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
-                    jv = jv + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
-            else:
-                for i_d in range(n_dofs):
-                    jv = jv + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
-            constraint_state.jv[i_c, i_b] = jv
+    ti.loop_config(block_dim=_T)
+    for i_ in range(_B * _T):
+        tid = i_ % _T
+        i_b = i_ // _T
+
+        # Shared memory: load search once per block instead of once per constraint
+        sh_search = ti.simt.block.SharedArray((n_dofs,), gs.ti_float)
+
+        if constraint_state.n_constraints[i_b] > 0:
+            # Cooperatively load search into shared memory
+            i_d = tid
+            while i_d < n_dofs:
+                sh_search[i_d] = constraint_state.search[i_d, i_b]
+                i_d += _T
+
+            ti.simt.block.sync()
+
+            # Each thread handles constraints in strided pattern
+            n_con = constraint_state.n_constraints[i_b]
+            i_c = tid
+            while i_c < n_con:
+                jv = gs.ti_float(0.0)
+                if ti.static(static_rigid_sim_config.sparse_solve):
+                    for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
+                        i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+                        jv += constraint_state.jac[i_c, i_d, i_b] * sh_search[i_d]
+                else:
+                    for i_d in range(n_dofs):
+                        jv += constraint_state.jac[i_c, i_d, i_b] * sh_search[i_d]
+                constraint_state.jv[i_c, i_b] = jv
+                i_c += _T
 
 
 @ti.kernel(fastcache=gs.use_fastcache)
