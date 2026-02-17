@@ -781,7 +781,8 @@ def func_solve_decomposed_macrokernels(
     This maximizes kernel granularity, potentially allowing better GPU scheduling
     and more flexibility in execution, at the cost of more Python→C++ boundary crossings.
     """
-    iterations = rigid_global_info.iterations[None]
+    # iterations = rigid_global_info.iterations[None]
+    iterations = 50
     for _it in range(iterations):
         if use_parallel_ls:
             _kernel_parallel_linesearch_mv(
