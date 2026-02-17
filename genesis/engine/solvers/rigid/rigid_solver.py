@@ -375,6 +375,9 @@ class RigidSolver(Solver):
                 base_links_idx.append(joint.link.idx)
         self._base_links_idx = torch.tensor(base_links_idx, dtype=gs.tc_int, device=gs.device)
 
+        # Pre-cached index tensors for fast control_dofs_* paths (avoid sanitize overhead)
+        self._ctrl_all_dofs_idx = torch.arange(self.n_dofs, dtype=gs.tc_int, device=gs.device)
+
         # used for creating dummy fields for compilation to work
         self.n_qs_ = max(1, self.n_qs)
         self.n_dofs_ = max(1, self.n_dofs)
@@ -1833,6 +1836,38 @@ class RigidSolver(Solver):
     # ------------------------------------ control ---------------------------------------
     # ------------------------------------------------------------------------------------
 
+    def _fast_ctrl_mask(self, envs_idx, dofs_idx):
+        """Build indexing mask from simple types without GPU sync.
+
+        Returns a tuple of slices for None/int/slice/range inputs (no GPU tensor created,
+        no cudaStreamSynchronize). Returns None if the inputs require the full
+        indices_to_mask path (e.g. torch.Tensor or list indices).
+        """
+        # Convert each index to a slice if possible
+        d = self._idx_to_slice(dofs_idx)
+        if d is None:
+            return None
+        if self.n_envs == 0:
+            return (0, d)
+        e = self._idx_to_slice(envs_idx)
+        if e is None:
+            return None
+        return (e, d)
+
+    @staticmethod
+    def _idx_to_slice(idx):
+        if idx is None:
+            return slice(None)
+        t = type(idx)
+        if t is slice:
+            return idx
+        if t is range:
+            return slice(idx.start, idx.stop, idx.step)
+        if t is int or isinstance(idx, np.integer):
+            idx = int(idx)
+            return slice(idx, idx + 1)
+        return None
+
     def _sanitize_io_variables(
         self,
         tensor: "np.typing.ArrayLike | None",
@@ -2463,13 +2498,26 @@ class RigidSolver(Solver):
 
     def control_dofs_position(self, position, dofs_idx=None, envs_idx=None):
         if gs.use_zerocopy:
-            mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
+            mask = self._fast_ctrl_mask(envs_idx, dofs_idx)
+            if mask is None:
+                mask = (0, *indices_to_mask(dofs_idx)) if self.n_envs == 0 else indices_to_mask(envs_idx, dofs_idx)
             ctrl_mode = ti_to_torch(self.dofs_state.ctrl_mode, transpose=True, copy=False)
             ctrl_mode[mask] = gs.CTRL_MODE.POSITION
             ctrl_pos = ti_to_torch(self.dofs_state.ctrl_pos, transpose=True, copy=False)
             assign_indexed_tensor(ctrl_pos, mask, position)
             ctrl_vel = ti_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
             ctrl_vel[mask] = 0.0
+            return
+
+        # Fast path: skip full sanitization when selecting all dofs/envs
+        if dofs_idx is None and envs_idx is None:
+            position = torch.as_tensor(position, dtype=gs.tc_float, device=gs.device)
+            if self.n_envs == 0:
+                position = position.reshape(1, -1)
+            kernel_control_dofs_position(
+                position.contiguous(), self._ctrl_all_dofs_idx, self._scene._envs_idx,
+                self.dofs_state, self._static_rigid_sim_config,
+            )
             return
 
         position, dofs_idx, envs_idx = self._sanitize_io_variables(
