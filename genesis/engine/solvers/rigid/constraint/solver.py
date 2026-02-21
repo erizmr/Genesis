@@ -2368,16 +2368,6 @@ def func_linesearch_batch(
         constraint_state.ls_result[i_b] = 1
         res_alpha = 0.0
     else:
-        # Pre-declare so Taichi sees names across qd.static branches
-        p0_alpha = gs.qd_float(0.0)
-        p0_cost = gs.qd_float(0.0)
-        p0_deriv_0 = gs.qd_float(0.0)
-        p0_deriv_1 = gs.qd_float(0.0)
-        p1_alpha = gs.qd_float(0.0)
-        p1_cost = gs.qd_float(0.0)
-        p1_deriv_0 = gs.qd_float(0.0)
-        p1_deriv_1 = gs.qd_float(0.0)
-
         # Phase 1: Init + p0 + p1
         p0_alpha, p0_cost, p0_deriv_0, p0_deriv_1 = func_ls_init_and_eval_p0_opt(
             i_b,
@@ -2436,57 +2426,24 @@ def func_linesearch_batch(
                     alpha_2 = (p1_alpha + p2_alpha) * 0.5  # midpoint
 
                     while constraint_state.ls_it[i_b] < rigid_global_info.ls_iterations[None]:
-                        # Pre-declare all 3-alpha result vars for Taichi scoping
-                        _a0 = gs.qd_float(0.0)
-                        c0 = gs.qd_float(0.0)
-                        c0_d0 = gs.qd_float(0.0)
-                        c0_d1 = gs.qd_float(0.0)
-                        _a1 = gs.qd_float(0.0)
-                        c1 = gs.qd_float(0.0)
-                        c1_d0 = gs.qd_float(0.0)
-                        c1_d1 = gs.qd_float(0.0)
-                        _a2 = gs.qd_float(0.0)
-                        c2 = gs.qd_float(0.0)
-                        c2_d0 = gs.qd_float(0.0)
-                        c2_d1 = gs.qd_float(0.0)
-
-                        # Batch evaluate all 3 in one constraint loop
-                        (
-                            _a0,
-                            c0,
-                            c0_d0,
-                            c0_d1,
-                            _a1,
-                            c1,
-                            c1_d0,
-                            c1_d1,
-                            _a2,
-                            c2,
-                            c2_d0,
-                            c2_d1,
-                        ) = func_ls_point_fn_3alphas_opt(
+                        # Batch evaluate cost, gradient, hessian for all 3 alphas in one constraint loop
+                        costs, grads, hess = func_ls_point_fn_3alphas_opt(
                             i_b, alpha_0, alpha_1, alpha_2, constraint_state, rigid_global_info
                         )
+                        alphas = qd.Vector([alpha_0, alpha_1, alpha_2])
 
-                        # Check convergence among 3 candidates using local variables
+                        # Check convergence among 3 candidates
                         p1_next_alpha = alpha_0
                         p2_next_alpha = alpha_1
 
                         best_alpha = gs.qd_float(0.0)
                         best_cost = gs.qd_float(0.0)
                         best_found = False
-                        if qd.abs(c0_d0) < gtol:
-                            best_alpha = alpha_0
-                            best_cost = c0
-                            best_found = True
-                        if qd.abs(c1_d0) < gtol and (not best_found or c1 < best_cost):
-                            best_alpha = alpha_1
-                            best_cost = c1
-                            best_found = True
-                        if qd.abs(c2_d0) < gtol and (not best_found or c2 < best_cost):
-                            best_alpha = alpha_2
-                            best_cost = c2
-                            best_found = True
+                        for i in qd.static(range(3)):
+                            if qd.abs(grads[i]) < gtol and (not best_found or costs[i] < best_cost):
+                                best_alpha = alphas[i]
+                                best_cost = costs[i]
+                                best_found = True
 
                         if best_found:
                             res_alpha = best_alpha
@@ -2504,18 +2461,10 @@ def func_linesearch_batch(
                                 p1_cost,
                                 p1_deriv_0,
                                 p1_deriv_1,
-                                alpha_0,
-                                c0,
-                                c0_d0,
-                                c0_d1,
-                                alpha_1,
-                                c1,
-                                c1_d0,
-                                c1_d1,
-                                alpha_2,
-                                c2,
-                                c2_d0,
-                                c2_d1,
+                                alphas,
+                                costs,
+                                grads,
+                                hess,
                             )
                             (
                                 b2,
@@ -2529,22 +2478,14 @@ def func_linesearch_batch(
                                 p2_cost,
                                 p2_deriv_0,
                                 p2_deriv_1,
-                                alpha_0,
-                                c0,
-                                c0_d0,
-                                c0_d1,
-                                alpha_1,
-                                c1,
-                                c1_d0,
-                                c1_d1,
-                                alpha_2,
-                                c2,
-                                c2_d0,
-                                c2_d1,
+                                alphas,
+                                costs,
+                                grads,
+                                hess,
                             )
 
                             if b1 == 0 and b2 == 0:
-                                if c2 < p0_cost:
+                                if costs[2] < p0_cost:
                                     constraint_state.ls_result[i_b] = 0
                                 else:
                                     constraint_state.ls_result[i_b] = 7
