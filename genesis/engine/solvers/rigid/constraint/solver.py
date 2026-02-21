@@ -18,10 +18,6 @@ from ..collider.contact_island import ContactIsland
 if TYPE_CHECKING:
     from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
 
-USE_LS_OPT = os.environ.get("GS_SOLVER_LS_OPT", "0") == "1"
-
-# TODO: set always true for CI benchmark use.
-USE_LS_OPT = 1
 
 IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
 
@@ -2666,33 +2662,17 @@ def func_linesearch_batch(
         p1_deriv_1 = gs.qd_float(0.0)
 
         # Phase 1: Init + p0 + p1
-        if qd.static(USE_LS_OPT):
-            p0_alpha, p0_cost, p0_deriv_0, p0_deriv_1 = func_ls_init_and_eval_p0_opt(
-                i_b,
-                entities_info=entities_info,
-                dofs_state=dofs_state,
-                constraint_state=constraint_state,
-                rigid_global_info=rigid_global_info,
-                static_rigid_sim_config=static_rigid_sim_config,
-            )
-            p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = func_ls_point_fn_opt(
-                i_b, p0_alpha - p0_deriv_0 / p0_deriv_1, constraint_state, rigid_global_info
-            )
-        else:
-            func_ls_init(
-                i_b,
-                entities_info=entities_info,
-                dofs_state=dofs_state,
-                constraint_state=constraint_state,
-                rigid_global_info=rigid_global_info,
-                static_rigid_sim_config=static_rigid_sim_config,
-            )
-            p0_alpha, p0_cost, p0_deriv_0, p0_deriv_1 = func_ls_point_fn(
-                i_b, gs.qd_float(0.0), constraint_state, rigid_global_info
-            )
-            p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = func_ls_point_fn(
-                i_b, p0_alpha - p0_deriv_0 / p0_deriv_1, constraint_state, rigid_global_info
-            )
+        p0_alpha, p0_cost, p0_deriv_0, p0_deriv_1 = func_ls_init_and_eval_p0_opt(
+            i_b,
+            entities_info=entities_info,
+            dofs_state=dofs_state,
+            constraint_state=constraint_state,
+            rigid_global_info=rigid_global_info,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+        p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = func_ls_point_fn_opt(
+            i_b, p0_alpha - p0_deriv_0 / p0_deriv_1, constraint_state, rigid_global_info
+        )
 
         if p0_cost < p1_cost:
             p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = p0_alpha, p0_cost, p0_deriv_0, p0_deriv_1
@@ -2714,14 +2694,9 @@ def func_linesearch_batch(
                 p2_alpha, p2_cost, p2_deriv_0, p2_deriv_1 = p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1
                 p2update = 1
 
-                if qd.static(USE_LS_OPT):
-                    p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = func_ls_point_fn_opt(
-                        i_b, p1_alpha - p1_deriv_0 / p1_deriv_1, constraint_state, rigid_global_info
-                    )
-                else:
-                    p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = func_ls_point_fn(
-                        i_b, p1_alpha - p1_deriv_0 / p1_deriv_1, constraint_state, rigid_global_info
-                    )
+                p1_alpha, p1_cost, p1_deriv_0, p1_deriv_1 = func_ls_point_fn_opt(
+                    i_b, p1_alpha - p1_deriv_0 / p1_deriv_1, constraint_state, rigid_global_info
+                )
                 if qd.abs(p1_deriv_0) < gtol:
                     res_alpha = p1_alpha
                     done = True
@@ -2759,40 +2734,22 @@ def func_linesearch_batch(
                         c2_d1 = gs.qd_float(0.0)
 
                         # Batch evaluate all 3 in one constraint loop
-                        if qd.static(USE_LS_OPT):
-                            (
-                                _a0,
-                                c0,
-                                c0_d0,
-                                c0_d1,
-                                _a1,
-                                c1,
-                                c1_d0,
-                                c1_d1,
-                                _a2,
-                                c2,
-                                c2_d0,
-                                c2_d1,
-                            ) = func_ls_point_fn_3alphas_opt(
-                                i_b, alpha_0, alpha_1, alpha_2, constraint_state, rigid_global_info
-                            )
-                        else:
-                            (
-                                _a0,
-                                c0,
-                                c0_d0,
-                                c0_d1,
-                                _a1,
-                                c1,
-                                c1_d0,
-                                c1_d1,
-                                _a2,
-                                c2,
-                                c2_d0,
-                                c2_d1,
-                            ) = func_ls_point_fn_3alphas(
-                                i_b, alpha_0, alpha_1, alpha_2, constraint_state, rigid_global_info
-                            )
+                        (
+                            _a0,
+                            c0,
+                            c0_d0,
+                            c0_d1,
+                            _a1,
+                            c1,
+                            c1_d0,
+                            c1_d1,
+                            _a2,
+                            c2,
+                            c2_d0,
+                            c2_d1,
+                        ) = func_ls_point_fn_3alphas_opt(
+                            i_b, alpha_0, alpha_1, alpha_2, constraint_state, rigid_global_info
+                        )
 
                         # Check convergence among 3 candidates using local variables
                         p1_next_alpha = alpha_0
