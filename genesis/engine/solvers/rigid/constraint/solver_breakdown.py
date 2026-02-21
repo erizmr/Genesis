@@ -62,50 +62,6 @@ def _kernel_parallel_linesearch_mv(
             constraint_state.mv[i_d1, i_b] = mv
 
 
-# @qd.kernel(fastcache=gs.use_fastcache)
-# def _kernel_parallel_linesearch_jv(
-#     constraint_state: array_class.ConstraintState,
-#     static_rigid_sim_config: qd.template(),
-# ):
-#     """Compute jv = J @ search. T threads per env, search loaded into shared memory."""
-#     n_dofs = constraint_state.search.shape[0]
-#     _SHMEM_N_DOFS = qd.static(static_rigid_sim_config.tiled_n_dofs)
-#     _B = constraint_state.grad.shape[1]
-#     _T = qd.static(_JV_BLOCK)
-
-#     qd.loop_config(block_dim=_T)
-#     for i_ in range(_B * _T):
-#         tid = i_ % _T
-#         i_b = i_ // _T
-
-#         # Shared memory: load search once per block instead of once per constraint
-#         sh_search = qd.simt.block.SharedArray((_SHMEM_N_DOFS,), gs.qd_float)
-
-#         if constraint_state.n_constraints[i_b] > 0:
-#             # Cooperatively load search into shared memory
-#             i_d = tid
-#             while i_d < n_dofs:
-#                 sh_search[i_d] = constraint_state.search[i_d, i_b]
-#                 i_d += _T
-
-#             qd.simt.block.sync()
-
-#             # Each thread handles constraints in strided pattern
-#             n_con = constraint_state.n_constraints[i_b]
-#             i_c = tid
-#             while i_c < n_con:
-#                 jv = gs.qd_float(0.0)
-#                 if qd.static(static_rigid_sim_config.sparse_solve):
-#                     for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
-#                         i_dd = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
-#                         jv += constraint_state.jac[i_c, i_dd, i_b] * sh_search[i_dd]
-#                 else:
-#                     for i_dd in range(n_dofs):
-#                         jv += constraint_state.jac[i_c, i_dd, i_b] * sh_search[i_dd]
-#                 constraint_state.jv[i_c, i_b] = jv
-#                 i_c += _T
-
-
 @qd.kernel(fastcache=gs.use_fastcache)
 def _kernel_parallel_linesearch_jv(
     constraint_state: array_class.ConstraintState,
