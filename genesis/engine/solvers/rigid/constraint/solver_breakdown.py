@@ -513,7 +513,10 @@ def _kernel_update_constraint_cost(
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: qd.template(),
 ):
-    """Compute gauss and cost (reductions over dofs and constraints). One thread per env."""
+    """Compute gauss and cost (reductions over dofs and constraints). One thread per env.
+
+    Accumulation order matches func_update_constraint_batch: friction → gauss → quadratic.
+    """
     _B = constraint_state.grad.shape[1]
 
     qd.loop_config(block_dim=32)
@@ -529,32 +532,37 @@ def _kernel_update_constraint_cost(
             cost_i = gs.qd_float(0.0)
             gauss_i = gs.qd_float(0.0)
 
-            # Gauss cost from dofs
-            for i_d in range(n_dofs):
-                v = (
-                    0.5
-                    * (constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b])
-                    * (constraint_state.qacc[i_d, i_b] - dofs_state.acc_smooth[i_d, i_b])
-                )
-                gauss_i += v
-                cost_i += v
-
-            # Constraint cost: quadratic + friction linear
+            # 1. Friction linear cost (matches monolith order: friction first)
             for i_c in range(n_con):
-                cost_i += 0.5 * (
-                    constraint_state.Jaref[i_c, i_b] ** 2
-                    * constraint_state.efc_D[i_c, i_b]
-                    * constraint_state.active[i_c, i_b]
-                )
                 if ne <= i_c and i_c < nef:
                     f = constraint_state.efc_frictionloss[i_c, i_b]
                     r = constraint_state.diag[i_c, i_b]
                     rf = r * f
                     linear_neg = constraint_state.Jaref[i_c, i_b] <= -rf
                     linear_pos = constraint_state.Jaref[i_c, i_b] >= rf
-                    cost_i += linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_c, i_b]) + linear_pos * f * (
+                    floss_cost_local = linear_neg * f * (-0.5 * rf - constraint_state.Jaref[i_c, i_b])
+                    floss_cost_local = floss_cost_local + linear_pos * f * (
                         -0.5 * rf + constraint_state.Jaref[i_c, i_b]
                     )
+                    cost_i = cost_i + floss_cost_local
+
+            # 2. Gauss cost from dofs
+            for i_d in range(n_dofs):
+                v = (
+                    0.5
+                    * (constraint_state.Ma[i_d, i_b] - dofs_state.force[i_d, i_b])
+                    * (constraint_state.qacc[i_d, i_b] - dofs_state.acc_smooth[i_d, i_b])
+                )
+                gauss_i = gauss_i + v
+                cost_i = cost_i + v
+
+            # 3. Quadratic constraint cost
+            for i_c in range(n_con):
+                cost_i = cost_i + 0.5 * (
+                    constraint_state.Jaref[i_c, i_b] ** 2
+                    * constraint_state.efc_D[i_c, i_b]
+                    * constraint_state.active[i_c, i_b]
+                )
 
             constraint_state.gauss[i_b] = gauss_i
             constraint_state.cost[i_b] = cost_i
@@ -627,6 +635,41 @@ def _kernel_update_search_direction(
 
 
 # ================================================ Init kernels ================================================
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
+def _kernel_init_update_constraint(
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Init-only constraint update — wraps monolith's func_update_constraint for exact FP match."""
+    solver.func_update_constraint(
+        qacc=constraint_state.qacc,
+        Ma=constraint_state.Ma,
+        cost=constraint_state.cost,
+        dofs_state=dofs_state,
+        constraint_state=constraint_state,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
+def _kernel_init_update_gradient(
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Init-only gradient update — wraps monolith's func_update_gradient (dispatches to tiled on GPU)."""
+    solver.func_update_gradient(
+        dofs_state=dofs_state,
+        entities_info=entities_info,
+        constraint_state=constraint_state,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
@@ -717,10 +760,14 @@ def _kernel_init_search(
         constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
 
 
-# FIXME: decomposed init disabled — causes non-deterministic results on CUDA due to inter-kernel data races
-# when multiple @qd.kernel functions write/read shared state (qacc, Ma, Jaref) without synchronization.
-# The monolith init (single kernel) is used instead. See test_box_box_dynamics[gpu-implicitfast-Newton].
-@solver.func_solve_init.register(is_compatible=lambda *args, **kwargs: False)
+# Fixed: decomposed init used separate kernels for constraint update and gradient that produced slightly
+# different FP results from the monolith. The constraint had different cost accumulation order, and the
+# gradient used batch cholesky solve instead of tiled. These differences in the initial search direction
+# caused test_box_box_dynamics[gpu-implicitfast-Newton] flakiness (~10% failure rate, 40/40 after fix).
+# Fix: init uses _kernel_init_update_constraint and _kernel_init_update_gradient which wrap the monolith's
+# func_update_constraint and func_update_gradient respectively. Body keeps using decomposed kernels.
+
+@solver.func_solve_init.register(is_compatible=lambda *args, **kwargs: gs.backend in {gs.cuda})
 def func_solve_init_decomposed(
     dofs_info,
     dofs_state,
@@ -737,9 +784,9 @@ def func_solve_init_decomposed(
     2. Ma = M @ qacc (ndrange over dofs with entity lookup)
     3. Jaref = -aref + J @ qacc (ndrange over constraints — main optimization)
     4. Set improved flags
-    5. Update constraint (forces / qfrc / cost — reuse decomposed kernels)
+    5. Update constraint (wraps monolith's func_update_constraint for exact FP match)
     6. Newton hessian (Newton only — reuse existing kernel)
-    7. Update gradient (reuse existing kernel)
+    7. Update gradient (wraps monolith's func_update_gradient — uses tiled on GPU)
     8. search = -Mgrad (ndrange over dofs)
     """
     # 1. Warmstart selection
@@ -754,17 +801,17 @@ def func_solve_init_decomposed(
     # 4. Set improved flags (needed by decomposed update_constraint kernels)
     _kernel_init_improved(constraint_state, static_rigid_sim_config)
 
-    # 5. Update constraint (reuse decomposed kernels)
-    _kernel_update_constraint_forces(constraint_state, static_rigid_sim_config)
-    _kernel_update_constraint_qfrc(constraint_state, static_rigid_sim_config)
-    _kernel_update_constraint_cost(dofs_state, constraint_state, static_rigid_sim_config)
+    # 5. Update constraint (init-specific: wraps monolith's func_update_constraint for exact FP match)
+    _kernel_init_update_constraint(dofs_state, constraint_state, static_rigid_sim_config)
 
     # 6. Newton hessian (Newton only)
     if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
         _kernel_newton_only_nt_hessian(constraint_state, rigid_global_info, static_rigid_sim_config)
 
-    # 7. Update gradient
-    _kernel_update_gradient(entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config)
+    # 7. Update gradient (init-specific: wraps monolith's func_update_gradient, dispatches to tiled on GPU)
+    _kernel_init_update_gradient(
+        entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
+    )
 
     # 8. search = -Mgrad
     _kernel_init_search(constraint_state, static_rigid_sim_config)
