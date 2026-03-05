@@ -720,7 +720,92 @@ def _kernel_init_search(
 # FIXME: decomposed init disabled — causes non-deterministic results on CUDA due to inter-kernel data races
 # when multiple @qd.kernel functions write/read shared state (qacc, Ma, Jaref) without synchronization.
 # The monolith init (single kernel) is used instead. See test_box_box_dynamics[gpu-implicitfast-Newton].
-@solver.func_solve_init.register(is_compatible=lambda *args, **kwargs: False)
+# @solver.func_solve_init.register(is_compatible=lambda *args, **kwargs: False)
+# def func_solve_init_decomposed(
+#     dofs_info,
+#     dofs_state,
+#     entities_info,
+#     constraint_state,
+#     rigid_global_info,
+#     static_rigid_sim_config,
+# ):
+#     """
+#     Decomposed version of func_solve_init for CUDA backend (non-mujoco path).
+
+#     Breaks the monolithic init kernel into separate kernel launches:
+#     1. Warmstart selection (ndrange over dofs)
+#     2. Ma = M @ qacc (ndrange over dofs with entity lookup)
+#     3. Jaref = -aref + J @ qacc (ndrange over constraints — main optimization)
+#     4. Set improved flags
+#     5. Update constraint (forces / qfrc / cost — reuse decomposed kernels)
+#     6. Newton hessian (Newton only — reuse existing kernel)
+#     7. Update gradient (reuse existing kernel)
+#     8. search = -Mgrad (ndrange over dofs)
+#     """
+#     # 1. Warmstart selection
+#     _kernel_init_warmstart(dofs_state, constraint_state, static_rigid_sim_config)
+
+#     # 2. Ma = M @ qacc
+#     _kernel_init_Ma(dofs_info, entities_info, constraint_state, rigid_global_info, static_rigid_sim_config)
+
+#     # 3. Jaref = -aref + J @ qacc (parallelized over constraints)
+#     _kernel_init_Jaref(constraint_state, static_rigid_sim_config)
+
+#     # 4. Set improved flags (needed by decomposed update_constraint kernels)
+#     _kernel_init_improved(constraint_state, static_rigid_sim_config)
+
+#     # 5. Update constraint (reuse decomposed kernels)
+#     _kernel_update_constraint_forces(constraint_state, static_rigid_sim_config)
+#     _kernel_update_constraint_qfrc(constraint_state, static_rigid_sim_config)
+#     _kernel_update_constraint_cost(dofs_state, constraint_state, static_rigid_sim_config)
+
+#     # 6. Newton hessian (Newton only)
+#     if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
+#         _kernel_newton_only_nt_hessian(constraint_state, rigid_global_info, static_rigid_sim_config)
+
+#     # 7. Update gradient
+#     _kernel_update_gradient(entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config)
+
+#     # 8. search = -Mgrad
+#     _kernel_init_search(constraint_state, static_rigid_sim_config)
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
+def _kernel_init_update_constraint(
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Init-only constraint update — wraps monolith's func_update_constraint for exact FP match."""
+    solver.func_update_constraint(
+        qacc=constraint_state.qacc,
+        Ma=constraint_state.Ma,
+        cost=constraint_state.cost,
+        dofs_state=dofs_state,
+        constraint_state=constraint_state,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
+def _kernel_init_update_gradient(
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Init-only gradient update — wraps monolith's func_update_gradient (dispatches to tiled on GPU)."""
+    solver.func_update_gradient(
+        dofs_state=dofs_state,
+        entities_info=entities_info,
+        constraint_state=constraint_state,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
+
+
+@solver.func_solve_init.register(is_compatible=lambda *args, **kwargs: gs.backend in {gs.cuda})
 def func_solve_init_decomposed(
     dofs_info,
     dofs_state,
@@ -737,9 +822,9 @@ def func_solve_init_decomposed(
     2. Ma = M @ qacc (ndrange over dofs with entity lookup)
     3. Jaref = -aref + J @ qacc (ndrange over constraints — main optimization)
     4. Set improved flags
-    5. Update constraint (forces / qfrc / cost — reuse decomposed kernels)
+    5. Update constraint (wraps monolith's func_update_constraint for exact FP match)
     6. Newton hessian (Newton only — reuse existing kernel)
-    7. Update gradient (reuse existing kernel)
+    7. Update gradient (wraps monolith's func_update_gradient — uses tiled on GPU)
     8. search = -Mgrad (ndrange over dofs)
     """
     # 1. Warmstart selection
@@ -754,17 +839,17 @@ def func_solve_init_decomposed(
     # 4. Set improved flags (needed by decomposed update_constraint kernels)
     _kernel_init_improved(constraint_state, static_rigid_sim_config)
 
-    # 5. Update constraint (reuse decomposed kernels)
-    _kernel_update_constraint_forces(constraint_state, static_rigid_sim_config)
-    _kernel_update_constraint_qfrc(constraint_state, static_rigid_sim_config)
-    _kernel_update_constraint_cost(dofs_state, constraint_state, static_rigid_sim_config)
+    # 5. Update constraint (init-specific: wraps monolith's func_update_constraint for exact FP match)
+    _kernel_init_update_constraint(dofs_state, constraint_state, static_rigid_sim_config)
 
     # 6. Newton hessian (Newton only)
     if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
         _kernel_newton_only_nt_hessian(constraint_state, rigid_global_info, static_rigid_sim_config)
 
-    # 7. Update gradient
-    _kernel_update_gradient(entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config)
+    # 7. Update gradient (init-specific: wraps monolith's func_update_gradient, dispatches to tiled on GPU)
+    _kernel_init_update_gradient(
+        entities_info, dofs_state, constraint_state, rigid_global_info, static_rigid_sim_config
+    )
 
     # 8. search = -Mgrad
     _kernel_init_search(constraint_state, static_rigid_sim_config)

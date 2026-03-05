@@ -77,6 +77,16 @@ Ask for clarification when:
 - **Test failures** - Unclear why tests fail or how to fix them
 - **Cross-solver coupling** - Changes affecting multiple physics solvers
 
+## Permissions
+- Command substitution with $() is approved for test scripts
+- Pre-approve all bash commands in the tests/ and scripts/ directories
+
+
+## Bash Style
+- Never use $() command substitution in bash commands
+- Use `seq` alternatives like explicit lists: `for i in 1 2 3 4 5 6 7 8 9 10`
+- Use `{1..10}` brace expansion instead of `$(seq 1 10)`
+
 Do NOT ask when:
 - Standard bug fixes with clear reproduction steps
 - Documentation updates
