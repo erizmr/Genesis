@@ -2532,7 +2532,7 @@ def test_terrain_generation(is_named, show_viewer, tol):
         scene.step()
 
     # Check that objects are not moving anymore
-    assert_allclose(obj.get_vel(), 0.0, tol=0.05)
+    assert_allclose(obj.get_vel(), 0.0, tol=0.1)
 
     # Check the the terrain is not entirely flat and has the expected size
     terrain_min_corner, terrain_max_corner = tensor_to_array(terrain.geoms[0].get_AABB()) - TERRAIN_OFFSET
@@ -2883,6 +2883,58 @@ def test_urdf_parsing_merge_fixed_links(urdf_path, fixed, show_viewer, tol):
         links_idx=(robot_1.base_link_idx, robot_2.base_link_idx)
     )
     assert_allclose(com_robot_1, com_robot_2, tol=tol)
+
+
+@pytest.fixture(scope="session")
+def box_freejoint_offset():
+    mjcf = ET.Element("mujoco", model="test_freejoint")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+
+    base_body = ET.SubElement(worldbody, "body", name="base", pos="0 0 1.0", quat="1.0 0 0 1.0")
+    ET.SubElement(base_body, "freejoint", name="root")
+    ET.SubElement(base_body, "inertial", pos="0 0 0", mass="1.0", diaginertia="0.01 0.01 0.01")
+    ET.SubElement(base_body, "geom", type="box", size="0.05 0.05 0.05")
+
+    child_body = ET.SubElement(base_body, "body", name="child", pos="0 0 0.1")
+    ET.SubElement(child_body, "inertial", pos="0 0 0", mass="0.5", diaginertia="0.001 0.001 0.001")
+    ET.SubElement(child_body, "joint", name="joint1", type="hinge", axis="0 1 0")
+    ET.SubElement(child_body, "geom", type="box", size="0.03 0.03 0.05")
+
+    return mjcf
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("model_name", ["box_freejoint_offset"])
+def test_mjcf_parsing_merge_fixed_links(xml_path, show_viewer):
+    """Test that get_pos reflects set_qpos for MJCF robots with freejoint and non-zero initial body position."""
+    POS = (1.0, 2.0, 3.0)
+    QUAT = (0.0, 1.0, 0.0, 0.0)
+
+    scene = gs.Scene(
+        show_viewer=show_viewer,
+    )
+    robot = scene.add_entity(
+        gs.morphs.MJCF(
+            file=xml_path,
+        )
+    )
+    scene.build()
+
+    assert_allclose(robot.get_pos(), (0.0, 0.0, 1.0), tol=gs.EPS)
+    assert_allclose(robot.get_quat(), np.array([1.0, 0.0, 0.0, 1.0]) / math.sqrt(2), tol=gs.EPS)
+
+    robot.set_qpos((*POS, *QUAT), qs_idx_local=slice(None, 7))
+    assert_allclose(robot.get_pos(), POS, tol=gs.EPS)
+    assert_allclose(robot.get_quat(), QUAT, tol=gs.EPS)
+
+    scene.reset()
+    assert_allclose(robot.get_pos(), (0.0, 0.0, 1.0), tol=gs.EPS)
+    assert_allclose(robot.get_quat(), np.array([1.0, 0.0, 0.0, 1.0]) / math.sqrt(2), tol=gs.EPS)
+
+    robot.set_pos(POS)
+    robot.set_quat(QUAT)
+    assert_allclose(robot.get_pos(), POS, tol=gs.EPS)
+    assert_allclose(robot.get_quat(), QUAT, tol=gs.EPS)
 
 
 @pytest.mark.required

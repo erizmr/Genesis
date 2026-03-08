@@ -1,4 +1,3 @@
-import hashlib
 import os
 import time
 from pathlib import Path
@@ -7,22 +6,15 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-import wandb
 
 import genesis as gs
 
 from .utils import (
-    get_hardware_fingerprint,
     get_hf_dataset,
-    get_platform_fingerprint,
     get_git_commit_timestamp,
-    get_git_commit_info,
     pprint_oneline,
 )
 
-
-BENCHMARK_NAME = "rigid_body"
-REPORT_FILE = "speed_test.txt"
 
 STEP_DT = 0.01
 DURATION_WARMUP = 45.0
@@ -203,8 +195,8 @@ def get_file_morph_options(**kwargs):
 
 
 @pytest.fixture(scope="session")
-def stream_writers(printer_session):
-    report_path = Path(REPORT_FILE)
+def stream_writers(printer_session, request):
+    report_path = Path(request.config.getoption("--speed-test-filepath"))
 
     # Delete old unrelated worker-specific reports
     worker_id = os.environ.get("PYTEST_XDIST_WORKER")
@@ -238,67 +230,15 @@ def factory_logger(stream_writers):
                 "dtype": "ndarray" if gs.use_ndarray else "field",
                 "backend": str(gs.backend.name),
             }
-            self.benchmark_id = "-".join((BENCHMARK_NAME, pprint_oneline(self.hparams, delimiter="-")))
-
-            self.logger = None
-            self.wandb_run = None
 
         def __enter__(self):
-            nonlocal stream_writers
-
-            if "WANDB_API_KEY" in os.environ:
-                assert gs.backend is not None
-                revision, timestamp = get_git_commit_info()
-
-                hardware_fringerprint = get_hardware_fingerprint(include_gpu=(gs.backend != gs.cpu))
-                platform_fringerprint = get_platform_fingerprint()
-                machine_uuid = hashlib.md5(
-                    "-".join((hardware_fringerprint, platform_fringerprint)).encode("UTF-8")
-                ).hexdigest()
-
-                benchmark_uuid = hashlib.md5(self.benchmark_id.encode("UTF-8")).hexdigest()
-
-                run_uuid = hashlib.md5(
-                    "-".join((hardware_fringerprint, platform_fringerprint, self.benchmark_id, revision)).encode(
-                        "UTF-8"
-                    )
-                ).hexdigest()
-
-                self.wandb_run = wandb.init(
-                    project="genesis-benchmarks",
-                    name="-".join((self.benchmark_id, revision)),
-                    id=run_uuid,
-                    tags=[BENCHMARK_NAME, benchmark_uuid],
-                    config={
-                        "revision": revision,
-                        "timestamp": timestamp,
-                        "machine_uuid": machine_uuid,
-                        "hardware": hardware_fringerprint,
-                        "platform": platform_fringerprint,
-                        "benchmark_id": self.benchmark_id,
-                        **self.hparams,
-                    },
-                    settings=wandb.Settings(
-                        x_disable_stats=True,
-                        console="off",
-                    ),
-                )
             return self
 
         def __exit__(self, exc_type, exc_value, traceback):
-            if self.wandb_run is not None:
-                self.wandb_run.finish()
+            pass
 
         def write(self, items):
             nonlocal stream_writers
-
-            if self.wandb_run is not None:
-                self.wandb_run.log(
-                    {
-                        "timestamp": self.wandb_run.config["timestamp"],
-                        **items,
-                    }
-                )
 
             if stream_writers:
                 msg = (
@@ -375,8 +315,7 @@ def go2(solver, n_envs, gjk, pytorch_profiler_step):
     return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
 
 
-@pytest.fixture
-def anymal(solver, n_envs, gjk, pytorch_profiler_step):
+def _anymal(solver, n_envs, gjk, control, with_kinematic, profiler_step):
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             **get_rigid_solver_options(
@@ -398,6 +337,11 @@ def anymal(solver, n_envs, gjk, pytorch_profiler_step):
             )
         ),
     )
+    if with_kinematic:
+        ghost = scene.add_entity(
+            gs.morphs.URDF(file="urdf/anymal_c/urdf/anymal_c.urdf", pos=(0, -0.5, 0.8)),
+            material=gs.materials.Kinematic(),
+        )
     time_start = time.time()
     scene.build(n_envs=n_envs)
     compile_time = time.time() - time_start
@@ -406,12 +350,27 @@ def anymal(solver, n_envs, gjk, pytorch_profiler_step):
     robot.set_dofs_kp(1000.0, motors_dof_idx)
     robot.control_dofs_position(0.0, motors_dof_idx)
 
+    if control == "uniform":
+        rand_shape = (12,)
+    elif control == "per_env":
+        rand_shape = (n_envs, 12)
+    else:
+        rand_shape = None
+
     num_steps = 0
     is_recording = False
     time_start = time.time()
     while True:
+        if rand_shape is not None:
+            robot.control_dofs_position(
+                torch.rand(rand_shape, dtype=gs.tc_float, device=gs.device) * 0.1 - 0.05, motors_dof_idx
+            )
+        if with_kinematic:
+            ghost.set_dofs_position(
+                torch.rand(rand_shape, dtype=gs.tc_float, device=gs.device) * 0.1 - 0.05, motors_dof_idx
+            )
         scene.step()
-        pytorch_profiler_step()
+        profiler_step()
         time_elapsed = time.time() - time_start
         if is_recording:
             num_steps += 1
@@ -424,61 +383,26 @@ def anymal(solver, n_envs, gjk, pytorch_profiler_step):
     realtime_factor = runtime_fps * STEP_DT
 
     return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+
+
+@pytest.fixture
+def anymal_zero(solver, n_envs, gjk, pytorch_profiler_step):
+    return _anymal(solver, n_envs, gjk, control=None, with_kinematic=False, profiler_step=pytorch_profiler_step)
+
+
+@pytest.fixture
+def anymal_uniform(solver, n_envs, gjk, pytorch_profiler_step):
+    return _anymal(solver, n_envs, gjk, control="uniform", with_kinematic=False, profiler_step=pytorch_profiler_step)
 
 
 @pytest.fixture
 def anymal_random(solver, n_envs, gjk, pytorch_profiler_step):
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            **get_rigid_solver_options(
-                dt=STEP_DT,
-                **(dict(constraint_solver=solver) if solver is not None else {}),
-                **(dict(use_gjk_collision=gjk) if gjk is not None else {}),
-            )
-        ),
-        show_viewer=False,
-        show_FPS=False,
-    )
+    return _anymal(solver, n_envs, gjk, control="per_env", with_kinematic=False, profiler_step=pytorch_profiler_step)
 
-    scene.add_entity(gs.morphs.Plane())
-    robot = scene.add_entity(
-        gs.morphs.URDF(
-            **get_file_morph_options(
-                file="urdf/anymal_c/urdf/anymal_c.urdf",
-                pos=(0, 0, 0.8),
-            )
-        ),
-    )
-    time_start = time.time()
-    scene.build(n_envs=n_envs)
-    compile_time = time.time() - time_start
 
-    motors_dof_idx = slice(6, None)
-    robot.set_dofs_kp(1000.0, motors_dof_idx)
-    robot.control_dofs_position(0.0, motors_dof_idx)
-
-    num_steps = 0
-    is_recording = False
-    time_start = time.time()
-    while True:
-        robot.control_dofs_position(
-            torch.rand((n_envs, 12), dtype=gs.tc_float, device=gs.device) * 0.1 - 0.05, motors_dof_idx
-        )
-        scene.step()
-        pytorch_profiler_step()
-
-        time_elapsed = time.time() - time_start
-        if is_recording:
-            num_steps += 1
-            if time_elapsed > DURATION_RECORD:
-                break
-        elif time_elapsed > DURATION_WARMUP:
-            time_start = time.time()
-            is_recording = True
-    runtime_fps = int(num_steps * max(n_envs, 1) / time_elapsed)
-    realtime_factor = runtime_fps * STEP_DT
-
-    return {"compile_time": compile_time, "runtime_fps": runtime_fps, "realtime_factor": realtime_factor}
+@pytest.fixture
+def anymal_uniform_kinematic(solver, n_envs, gjk, pytorch_profiler_step):
+    return _anymal(solver, n_envs, gjk, control="uniform", with_kinematic=True, profiler_step=pytorch_profiler_step)
 
 
 def _franka(solver, n_envs, gjk, is_collision_free, is_randomized, accessors, profiler_step):
@@ -859,8 +783,11 @@ def g1_fall(solver, n_envs, gjk, pytorch_profiler_step):
         ("duck_in_box_hard", None, False, 30000, gs.gpu),
         ("duck_in_box_hard", None, None, 0, gs.cpu),
         ("anymal_random", None, None, 30000, gs.gpu),
-        ("anymal", None, None, 30000, gs.gpu),
-        ("anymal", None, None, 0, gs.cpu),
+        ("anymal_uniform", None, None, 30000, gs.gpu),
+        ("anymal_zero", None, None, 30000, gs.gpu),
+        ("anymal_zero", None, None, 0, gs.cpu),
+        ("anymal_uniform_kinematic", None, None, 30000, gs.gpu),
+        ("anymal_uniform_kinematic", None, None, 0, gs.cpu),
         ("go2", None, True, 4096, gs.gpu),
         ("go2", gs.constraint_solver.CG, False, 4096, gs.gpu),
         ("go2", gs.constraint_solver.Newton, False, 4096, gs.gpu),
