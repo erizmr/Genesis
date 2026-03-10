@@ -209,10 +209,16 @@ class ConstraintSolver:
         )
 
     def noslip(self):
-        constraint_noslip.kernel_build_efc_AR_b(
-            self._solver.dofs_state,
+        # Phase 1: Compute MinvJT = M^{-1} @ J^T for each constraint row
+        constraint_noslip.kernel_compute_MinvJT(
             self._solver.entities_info,
             self._solver._rigid_global_info,
+            self.constraint_state,
+            self._solver._static_rigid_sim_config,
+        )
+        # Phase 2: Compute AR = J @ MinvJT and efc_b (parallelizable)
+        constraint_noslip.kernel_compute_AR_and_b(
+            self._solver.dofs_state,
             self.constraint_state,
             self._solver._static_rigid_sim_config,
         )
