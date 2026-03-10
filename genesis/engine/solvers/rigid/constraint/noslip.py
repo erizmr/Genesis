@@ -104,52 +104,36 @@ def kernel_compute_AR_and_b(
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: qd.template(),
 ):
-    """Phase 2: Compute AR = J @ MinvJT and efc_b.
+    """Phase 2: Compute AR = J @ MinvJT and efc_b (GPU multi-env only).
 
     AR[row, col, i_b] = sum_d J[col, d, i_b] * MinvJT[row, d, i_b]
 
-    On GPU (PARA_LEVEL.ALL), uses ndrange for full parallelism across all
-    (row, col, batch) combinations. On CPU, uses nested serial loops with
-    runtime-bounded iteration to avoid wasted work.
+    Uses ndrange for full GPU parallelism across (row, col, batch) — gives
+    nefc^2 * n_envs independent threads (~490K for typical scenes).
+
+    This kernel is only called when para_level >= PARA_LEVEL.ALL (GPU multi-env).
+    For CPU and GPU single-env, the fused kernel_build_efc_AR_b is used instead.
     """
     len_c = constraint_state.efc_AR.shape[0]
     _B = constraint_state.jac.shape[2]
     n_dofs = constraint_state.jac.shape[1]
 
-    if qd.static(static_rigid_sim_config.para_level >= gs.PARA_LEVEL.ALL):
-        # GPU path: fully parallel ndrange over (row, col, batch)
-        for i_row, i_col, i_b in qd.ndrange(len_c, len_c, _B):
-            nefc = constraint_state.n_constraints[i_b]
-            if i_row < nefc and i_col < nefc:
-                s = gs.qd_float(0.0)
-                for i_d in range(n_dofs):
-                    s += constraint_state.jac[i_col, i_d, i_b] * constraint_state.MinvJT[i_row, i_d, i_b]
-                constraint_state.efc_AR[i_row, i_col, i_b] = s
-            else:
-                constraint_state.efc_AR[i_row, i_col, i_b] = gs.qd_float(0.0)
+    for i_row, i_col, i_b in qd.ndrange(len_c, len_c, _B):
+        nefc = constraint_state.n_constraints[i_b]
+        if i_row < nefc and i_col < nefc:
+            s = gs.qd_float(0.0)
+            for i_d in range(n_dofs):
+                s += constraint_state.jac[i_col, i_d, i_b] * constraint_state.MinvJT[i_row, i_d, i_b]
+            constraint_state.efc_AR[i_row, i_col, i_b] = s
+        else:
+            constraint_state.efc_AR[i_row, i_col, i_b] = gs.qd_float(0.0)
 
-        for i_c, i_b in qd.ndrange(len_c, _B):
-            if i_c < constraint_state.n_constraints[i_b]:
-                v = -constraint_state.aref[i_c, i_b]
-                for i_d in range(n_dofs):
-                    v += constraint_state.jac[i_c, i_d, i_b] * dofs_state.acc_smooth[i_d, i_b]
-                constraint_state.efc_b[i_c, i_b] = v
-    else:
-        # CPU path: serial loops bounded by actual constraint count
-        for i_b in range(_B):
-            nefc = constraint_state.n_constraints[i_b]
-            for i_row in range(nefc):
-                for i_col in range(nefc):
-                    s = gs.qd_float(0.0)
-                    for i_d in range(n_dofs):
-                        s += constraint_state.jac[i_col, i_d, i_b] * constraint_state.MinvJT[i_row, i_d, i_b]
-                    constraint_state.efc_AR[i_row, i_col, i_b] = s
-
-            for i_c in range(nefc):
-                v = -constraint_state.aref[i_c, i_b]
-                for i_d in range(n_dofs):
-                    v += constraint_state.jac[i_c, i_d, i_b] * dofs_state.acc_smooth[i_d, i_b]
-                constraint_state.efc_b[i_c, i_b] = v
+    for i_c, i_b in qd.ndrange(len_c, _B):
+        if i_c < constraint_state.n_constraints[i_b]:
+            v = -constraint_state.aref[i_c, i_b]
+            for i_d in range(n_dofs):
+                v += constraint_state.jac[i_c, i_d, i_b] * dofs_state.acc_smooth[i_d, i_b]
+            constraint_state.efc_b[i_c, i_b] = v
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
