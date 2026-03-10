@@ -58,6 +58,85 @@ def kernel_build_efc_AR_b(
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
+def kernel_compute_MinvJT(
+    entities_info: array_class.EntitiesInfo,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Phase 1: Compute MinvJT[row, :, i_b] = M^{-1} @ J[row, :, i_b] for each constraint row.
+
+    This phase is serial per row within each env because func_solve_mass_batch
+    uses the shared Mgrad buffer. The results are stored in MinvJT so that
+    Phase 2 can parallelize the AR matrix computation.
+    """
+    _B = constraint_state.jac.shape[2]
+    n_dofs = constraint_state.jac.shape[1]
+
+    qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b in range(_B):
+        nefc = constraint_state.n_constraints[i_b]
+        for i_row in range(nefc):
+            # Copy J[row] to Mgrad (temporary buffer for mass solve)
+            for i_d in range(n_dofs):
+                constraint_state.Mgrad[i_d, i_b] = constraint_state.jac[i_row, i_d, i_b]
+
+            # Solve M^{-1} @ J[row] in-place
+            rigid_solver.func_solve_mass_batch(
+                i_b,
+                constraint_state.Mgrad,
+                constraint_state.Mgrad,
+                array_class.PLACEHOLDER,
+                entities_info=entities_info,
+                rigid_global_info=rigid_global_info,
+                static_rigid_sim_config=static_rigid_sim_config,
+                is_backward=False,
+            )
+
+            # Store result in MinvJT[row, :, i_b]
+            for i_d in range(n_dofs):
+                constraint_state.MinvJT[i_row, i_d, i_b] = constraint_state.Mgrad[i_d, i_b]
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
+def kernel_compute_AR_and_b(
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Phase 2: Compute AR = J @ MinvJT^T and efc_b.
+
+    AR[row, col, i_b] = sum_d J[col, d, i_b] * MinvJT[row, d, i_b]
+
+    This kernel is parallelizable over (i_row, i_col, i_b) since all dot products
+    are independent — each output element depends only on two rows of pre-computed data.
+    On GPU this gives nefc^2 * n_envs parallel threads (~490K for typical scenes).
+    """
+    len_c = constraint_state.efc_AR.shape[0]
+    _B = constraint_state.jac.shape[2]
+    n_dofs = constraint_state.jac.shape[1]
+
+    # Compute AR — parallelized over (i_row, i_col, i_b)
+    for i_row, i_col, i_b in qd.ndrange(len_c, len_c, _B):
+        nefc = constraint_state.n_constraints[i_b]
+        if i_row < nefc and i_col < nefc:
+            s = gs.qd_float(0.0)
+            for i_d in range(n_dofs):
+                s += constraint_state.jac[i_col, i_d, i_b] * constraint_state.MinvJT[i_row, i_d, i_b]
+            constraint_state.efc_AR[i_row, i_col, i_b] = s
+        else:
+            constraint_state.efc_AR[i_row, i_col, i_b] = gs.qd_float(0.0)
+
+    # Compute efc_b — parallelized over (i_c, i_b)
+    for i_c, i_b in qd.ndrange(len_c, _B):
+        if i_c < constraint_state.n_constraints[i_b]:
+            v = -constraint_state.aref[i_c, i_b]
+            for i_d in range(n_dofs):
+                v += constraint_state.jac[i_c, i_d, i_b] * dofs_state.acc_smooth[i_d, i_b]
+            constraint_state.efc_b[i_c, i_b] = v
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
 def kernel_noslip(
     collider_state: array_class.ColliderState,
     constraint_state: array_class.ConstraintState,
