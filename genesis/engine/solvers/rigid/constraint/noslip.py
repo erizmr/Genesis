@@ -57,6 +57,47 @@ def kernel_build_efc_AR_b(
             constraint_state.efc_b[i_c, i_b] = v
 
 
+@qd.func
+def func_solve_mass_entity_row(
+    i_row: qd.int32,
+    i_e: qd.int32,
+    i_b: qd.int32,
+    buf: array_class.V_ANNOTATION,
+    entities_info: array_class.EntitiesInfo,
+    rigid_global_info: array_class.RigidGlobalInfo,
+):
+    """LDL^T forward-backward substitution on buf[i_row, :, i_b].
+
+    Same algorithm as func_solve_mass_entity (forward-only path), but operates
+    on a 3D buffer indexed by (constraint_row, dof, batch). This allows
+    different constraint rows to be solved in parallel since each row uses
+    a separate memory slice.
+    """
+    if rigid_global_info.mass_mat_mask[i_e, i_b]:
+        entity_dof_start = entities_info.dof_start[i_e]
+        entity_dof_end = entities_info.dof_end[i_e]
+        n_dofs = entities_info.n_dofs[i_e]
+
+        # Step 1: Solve w s.t. L^T @ w = y (backward substitution)
+        for i_d_ in range(n_dofs):
+            i_d = entity_dof_end - i_d_ - 1
+            curr_out = buf[i_row, i_d, i_b]
+            for j_d in range(i_d + 1, entity_dof_end):
+                curr_out = curr_out - rigid_global_info.mass_mat_L[j_d, i_d, i_b] * buf[i_row, j_d, i_b]
+            buf[i_row, i_d, i_b] = curr_out
+
+        # Step 2: z = D^{-1} @ w
+        for i_d in range(entity_dof_start, entity_dof_end):
+            buf[i_row, i_d, i_b] = buf[i_row, i_d, i_b] * rigid_global_info.mass_mat_D_inv[i_d, i_b]
+
+        # Step 3: Solve x s.t. L @ x = z (forward substitution)
+        for i_d in range(entity_dof_start, entity_dof_end):
+            curr_out = buf[i_row, i_d, i_b]
+            for j_d in range(entity_dof_start, i_d):
+                curr_out = curr_out - rigid_global_info.mass_mat_L[i_d, j_d, i_b] * buf[i_row, j_d, i_b]
+            buf[i_row, i_d, i_b] = curr_out
+
+
 @qd.kernel(fastcache=gs.use_fastcache)
 def kernel_compute_MinvJT(
     entities_info: array_class.EntitiesInfo,
@@ -64,38 +105,38 @@ def kernel_compute_MinvJT(
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: qd.template(),
 ):
-    """Phase 1: Compute MinvJT[row, :, i_b] = M^{-1} @ J[row, :, i_b] for each constraint row.
+    """Compute MinvJT[row, :, i_b] = M^{-1} @ J[row, :, i_b] for each constraint row.
 
-    This phase is serial per row within each env because func_solve_mass_batch
-    uses the shared Mgrad buffer. The results are stored in MinvJT so that
-    Phase 2 can parallelize the AR matrix computation.
+    Parallelized over (row, batch) via ndrange — each thread independently
+    copies J[row] into MinvJT[row] and solves M^{-1} in-place using the
+    row-indexed LDL^T substitution. No shared buffers between rows.
     """
+    len_c = constraint_state.MinvJT.shape[0]
     _B = constraint_state.jac.shape[2]
     n_dofs = constraint_state.jac.shape[1]
 
-    qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
-    for i_b in range(_B):
-        nefc = constraint_state.n_constraints[i_b]
-        for i_row in range(nefc):
-            # Copy J[row] to Mgrad (temporary buffer for mass solve)
+    for i_row, i_b in qd.ndrange(len_c, _B):
+        if i_row < constraint_state.n_constraints[i_b]:
+            # Copy J[row] into MinvJT[row] (per-row buffer)
             for i_d in range(n_dofs):
-                constraint_state.Mgrad[i_d, i_b] = constraint_state.jac[i_row, i_d, i_b]
+                constraint_state.MinvJT[i_row, i_d, i_b] = constraint_state.jac[i_row, i_d, i_b]
 
-            # Solve M^{-1} @ J[row] in-place
-            rigid_solver.func_solve_mass_batch(
-                i_b,
-                constraint_state.Mgrad,
-                constraint_state.Mgrad,
-                array_class.PLACEHOLDER,
-                entities_info=entities_info,
-                rigid_global_info=rigid_global_info,
-                static_rigid_sim_config=static_rigid_sim_config,
-                is_backward=False,
-            )
-
-            # Store result in MinvJT[row, :, i_b]
-            for i_d in range(n_dofs):
-                constraint_state.MinvJT[i_row, i_d, i_b] = constraint_state.Mgrad[i_d, i_b]
+            # In-place solve: MinvJT[row] = M^{-1} @ J[row]
+            for i_0 in (
+                range(rigid_global_info.n_awake_entities[i_b])
+                if qd.static(static_rigid_sim_config.use_hibernation)
+                else range(entities_info.n_links.shape[0])
+            ):
+                i_e = (
+                    rigid_global_info.awake_entities[i_0, i_b]
+                    if qd.static(static_rigid_sim_config.use_hibernation)
+                    else i_0
+                )
+                func_solve_mass_entity_row(
+                    i_row, i_e, i_b,
+                    constraint_state.MinvJT,
+                    entities_info, rigid_global_info,
+                )
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
