@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 
     from .sensor_manager import SensorManager
 
+import trimesh
+
 STEFAN_BOLTZMANN = 5.670374419e-8  # W / (m²·K⁴)
 KELVIN_OFFSET = 273.15
 PI = math.pi
@@ -68,6 +70,93 @@ class _ScratchIdx(IntEnum):
     GROUP_POS2_Y = 18
 
 
+def _link_aabb_extent_from_geoms(link: "RigidLink") -> np.ndarray:
+    """Compute AABB extent of a link from its collision geom vertices in link-local frame.
+
+    Works before scene.build() since it only uses geom init data (vertices, pos, quat).
+    """
+    all_verts = []
+    for geom in link.geoms:
+        verts = geom.init_verts  # (N, 3) in geom mesh frame
+        # Transform to link-local frame: p_link = R(quat) @ p_mesh + pos
+        verts_local = gu.transform_by_trans_quat(verts, geom.init_pos, geom.init_quat)
+        all_verts.append(verts_local)
+    if not all_verts:
+        return np.array([0.01, 0.01, 0.01])
+    all_verts = np.concatenate(all_verts, axis=0)
+    extent = all_verts.max(axis=0) - all_verts.min(axis=0)
+    return np.maximum(extent, 1e-6)
+
+
+def _build_occupancy_mask(
+    link: "RigidLink", grid_size: tuple[int, int, int], aabb_min: np.ndarray, voxel_size: np.ndarray
+) -> torch.Tensor:
+    """Build binary occupancy mask (1=solid, 0=air) by voxelizing link collision geoms.
+
+    For each geom, creates a trimesh, transforms to link-local frame, and checks which
+    voxel centers fall inside the mesh (negative signed distance).
+
+    Returns shape (nx, ny, nz) float tensor on gs.device.
+    """
+    nx, ny, nz = grid_size
+    # Voxel center positions in link-local frame
+    xs = (np.arange(nx) + 0.5) * voxel_size[0] + aabb_min[0]
+    ys = (np.arange(ny) + 0.5) * voxel_size[1] + aabb_min[1]
+    zs = (np.arange(nz) + 0.5) * voxel_size[2] + aabb_min[2]
+    gx, gy, gz = np.meshgrid(xs, ys, zs, indexing="ij")
+    query_points = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)  # (N, 3)
+
+    occupancy = np.zeros(nx * ny * nz, dtype=np.float32)
+
+    for geom in link.geoms:
+        verts = geom.init_verts.copy()
+        faces = geom.init_faces.copy()
+        if len(verts) == 0 or len(faces) == 0:
+            continue
+        # Transform geom vertices to link-local frame
+        verts_local = gu.transform_by_trans_quat(verts, geom.init_pos, geom.init_quat)
+        mesh = trimesh.Trimesh(vertices=verts_local, faces=faces, process=False)
+        if not mesh.is_watertight:
+            # For non-watertight meshes, fill the convex hull instead
+            try:
+                mesh = mesh.convex_hull
+            except Exception:
+                # Fallback: mark all voxels as solid
+                occupancy[:] = 1.0
+                continue
+        # Check which query points are inside this geom
+        inside = mesh.contains(query_points)
+        occupancy[inside] = 1.0
+
+    # If no geom produced any solid voxels, fall back to all-solid
+    if occupancy.sum() == 0:
+        occupancy[:] = 1.0
+
+    return torch.tensor(occupancy.reshape(nx, ny, nz), dtype=gs.tc_float, device=gs.device)
+
+
+def _compute_surface_mask_from_occupancy(occupancy: torch.Tensor) -> torch.Tensor:
+    """Surface = solid voxel with at least one air face-neighbor (6-connectivity).
+
+    Args:
+        occupancy: shape (nx, ny, nz), float 0/1
+    Returns:
+        surface mask shape (nx, ny, nz), float 0/1
+    """
+    # Pad with air (0) on all faces
+    padded = torch.nn.functional.pad(occupancy.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1, 1, 1), value=0.0)
+    padded = padded.squeeze(0).squeeze(0)  # (nx+2, ny+2, nz+2)
+    has_air_neighbor = (
+        (padded[:-2, 1:-1, 1:-1] < 0.5)
+        | (padded[2:, 1:-1, 1:-1] < 0.5)
+        | (padded[1:-1, :-2, 1:-1] < 0.5)
+        | (padded[1:-1, 2:, 1:-1] < 0.5)
+        | (padded[1:-1, 1:-1, :-2] < 0.5)
+        | (padded[1:-1, 1:-1, 2:] < 0.5)
+    )
+    return ((occupancy > 0.5) & has_air_neighbor).to(gs.tc_float)
+
+
 def _compute_K2_rfft3(nx: int, ny: int, nz: int, dx: float, dy: float, dz: float) -> torch.Tensor:
     """Squared wave numbers for 3D real FFT: K2[i,j,k] = (2*pi*kx)^2 + (2*pi*ky)^2 + (2*pi*kz)^2 with rfft layout."""
     kx = torch.fft.fftfreq(nx, d=dx, device=gs.device).to(gs.tc_float)
@@ -96,12 +185,15 @@ def _apply_diffusion_and_heat_generation(
     cache_sizes: list[int],
     grid_size: torch.Tensor,
     heat_generation: list[torch.Tensor | None],
+    occupancy_mask: list[torch.Tensor | None],
     voxel_size: torch.Tensor,
     links_idx: torch.Tensor,
     link_to_material_idx: torch.Tensor,
     link_rho_cp: torch.Tensor,
     link_conductivity: torch.Tensor,
+    link_base_temperature: torch.Tensor,
     K2_spectral: list[torch.Tensor],
+    ambient_temperature: float,
     dt: float,
     output: torch.Tensor,
 ) -> None:
@@ -125,6 +217,23 @@ def _apply_diffusion_and_heat_generation(
         T_hat = T_hat / (1.0 + dt * alpha * K2_spectral[i_s])
         T_pad = torch.fft.irfftn(T_hat, s=(2 * nx, 2 * ny, 2 * nz), dim=(-3, -2, -1)).real
         T = T_pad[:, :nx, :ny, :nz]
+
+        # Project: zero air voxels but recover leaked heat to conserve energy.
+        # FFT diffusion spreads heat into air voxels. We recover that excess energy
+        # (above ambient) and redistribute it to solid voxels before zeroing air.
+        occ = occupancy_mask[i_s]
+        if occ is not None:
+            air = occ < 0.5  # (nx, ny, nz)
+            solid = ~air
+            n_solid = solid.sum().item()
+            n_air = air.sum().item()
+            if n_solid > 0 and n_air > 0:
+                # Heat that leaked to air = sum of (T_air - ambient) across air voxels
+                leaked = (T[:, air] - ambient_temperature).sum(dim=-1)  # (B,)
+                # Return leaked heat to solid voxels
+                T[:, solid] += (leaked / n_solid).unsqueeze(-1)
+            T[:, air] = ambient_temperature
+
         output[:, start : start + size] = T.reshape(n_batches, -1)
 
         # Add internal heat generation (W/m² -> Q_vol = Q_surface / dz).
@@ -460,6 +569,72 @@ def _apply_radiation_convection(
         link_temps.sub_(delta * valid.unsqueeze(0).to(gs.tc_float))
 
 
+def _apply_kinematic_conduction(
+    kinematic_edges: torch.Tensor,
+    kinematic_joint_area: torch.Tensor,
+    link_temps: torch.Tensor,
+    link_volume: torch.Tensor,
+    link_to_material_idx: torch.Tensor,
+    link_conductivity: torch.Tensor,
+    link_rho_cp: torch.Tensor,
+    dt: float,
+) -> None:
+    """Heat conduction between kinematically adjacent (parent-child) link pairs.
+
+    Uses the same effective-conductivity model as _kernel_contact_heat (lines 374-400):
+        k_eff = 2*k_a*k_b / (k_a + k_b)
+        length_scale = (vol_a + vol_b) / (2 * joint_area)
+        flux = k_eff * (T_a - T_b) / length_scale
+        power = flux * joint_area
+        dT_a = -dt * power / (rho_cp_a * vol_a)
+        dT_b =  dt * power / (rho_cp_b * vol_b)
+    """
+    if kinematic_edges.shape[0] == 0 or link_temps.numel() == 0:
+        return
+
+    parent_idx = kinematic_edges[:, 0]  # (E,)
+    child_idx = kinematic_edges[:, 1]  # (E,)
+    joint_area = kinematic_joint_area  # (E,)
+
+    mat_p = link_to_material_idx[parent_idx]  # (E,)
+    mat_c = link_to_material_idx[child_idx]  # (E,)
+
+    # Only conduct between pairs where both links have valid materials
+    valid = (mat_p >= 0) & (mat_c >= 0)
+    if not valid.any():
+        return
+
+    k_p = link_conductivity[mat_p]  # (E,)
+    k_c = link_conductivity[mat_c]  # (E,)
+    k_eff = 2.0 * k_p * k_c / (k_p + k_c + gs.EPS)  # (E,)
+
+    vol_p = link_volume[parent_idx] + gs.EPS  # (E,)
+    vol_c = link_volume[child_idx] + gs.EPS  # (E,)
+
+    length_scale = (vol_p + vol_c) / (2.0 * joint_area + gs.EPS)  # (E,)
+    rcp_vol_p = link_rho_cp[mat_p] * vol_p + gs.EPS  # (E,)
+    rcp_vol_c = link_rho_cp[mat_c] * vol_c + gs.EPS  # (E,)
+
+    # link_temps shape: (n_batches, n_links)
+    T_p = link_temps[:, parent_idx]  # (B, E)
+    T_c = link_temps[:, child_idx]  # (B, E)
+
+    flux = k_eff.unsqueeze(0) * (T_p - T_c) / length_scale.unsqueeze(0)  # (B, E)
+    power = flux * joint_area.unsqueeze(0)  # (B, E)
+
+    delta_T_p = -dt * power / rcp_vol_p.unsqueeze(0)  # (B, E)
+    delta_T_c = dt * power / rcp_vol_c.unsqueeze(0)  # (B, E)
+
+    # Mask invalid edges
+    mask = valid.unsqueeze(0).to(gs.tc_float)  # (1, E)
+    delta_T_p = delta_T_p * mask
+    delta_T_c = delta_T_c * mask
+
+    # Scatter-add deltas back to link_temps
+    link_temps.scatter_add_(1, parent_idx.unsqueeze(0).expand_as(delta_T_p), delta_T_p)
+    link_temps.scatter_add_(1, child_idx.unsqueeze(0).expand_as(delta_T_c), delta_T_c)
+
+
 def _apply_T_measured_filter(
     sensor_cache_start: torch.Tensor,
     cache_sizes: list[int],
@@ -495,6 +670,10 @@ class TemperatureGridSensorMetadata(RigidSensorMetadataMixin, NoisySensorMetadat
     link_temps: torch.Tensor = make_tensor_field((0, 0))
     link_volume: torch.Tensor = make_tensor_field((0,))
 
+    kinematic_conduction: bool = False
+    kinematic_edges: torch.Tensor = make_tensor_field((0, 2), dtype=gs.tc_int)
+    kinematic_joint_area: torch.Tensor = make_tensor_field((0,))
+
     aabb_min: torch.Tensor = make_tensor_field((0, 3))
     aabb_extent: torch.Tensor = make_tensor_field((0, 3))
     grid_size: torch.Tensor = make_tensor_field((0, 3), dtype=gs.tc_int)
@@ -504,6 +683,7 @@ class TemperatureGridSensorMetadata(RigidSensorMetadataMixin, NoisySensorMetadat
     contact_depth_weight: torch.Tensor = make_tensor_field((0,))
     K2_spectral: list[torch.Tensor] = field(default_factory=list)
     sensor_surface_mask: list[torch.Tensor] = field(default_factory=list)
+    occupancy_mask: list[torch.Tensor | None] = field(default_factory=list)
     heat_generation: list[torch.Tensor | None] = field(default_factory=list)
     contact_area_scratch: torch.Tensor = make_tensor_field((0, len(_ScratchIdx)))
     contact_area_buffer: torch.Tensor = make_tensor_field((0, 0))
@@ -524,6 +704,18 @@ class TemperatureGridSensor(
         data_cls: Type[tuple],
         sensor_manager: "SensorManager",
     ):
+        # If voxel_resolution is set, compute grid_size from link geometry before super().__init__
+        # (which calls _get_return_format to determine cache size).
+        self._effective_grid_size: tuple[int, int, int] | None = None
+        if sensor_options.voxel_resolution is not None:
+            entity_idx = sensor_options.entity_idx
+            if entity_idx is not None and entity_idx >= 0:
+                entity = sensor_manager._sim._scene.entities[entity_idx]
+                link = entity.links[sensor_options.link_idx_local]
+                extent = _link_aabb_extent_from_geoms(link)
+                res = sensor_options.voxel_resolution
+                self._effective_grid_size = tuple(max(1, int(math.ceil(e / res))) for e in extent)
+
         super().__init__(sensor_options, sensor_idx, data_cls, sensor_manager)
 
         self._link: "RigidLink | None" = None
@@ -599,6 +791,34 @@ class TemperatureGridSensor(
                 n_batches = solver._B
                 self._shared_metadata.link_temps.copy_(base_T_per_link.unsqueeze(0).expand(n_batches, -1))
 
+        if self._options.kinematic_conduction:
+            self._shared_metadata.kinematic_conduction = True
+            if self._shared_metadata.kinematic_edges.shape[0] == 0 and self._shared_metadata.simulate_all_link_temps:
+                edges = []
+                for entity in solver._entities:
+                    for link in entity.links:
+                        if link.parent_idx >= 0:
+                            edges.append((link.parent_idx, link.idx))
+                if edges:
+                    self._shared_metadata.kinematic_edges = torch.tensor(edges, dtype=gs.tc_int, device=gs.device)
+                    # Joint cross-section area: min face area of child link's AABB
+                    joint_areas = []
+                    for _, child_idx in edges:
+                        child_link = solver.links[child_idx]
+                        if child_link.n_geoms > 0:
+                            aabb = child_link.get_AABB()
+                            if aabb.ndim == 3:
+                                aabb = aabb[0]
+                            ext = (aabb[1] - aabb[0]).clamp(min=gs.EPS)
+                            dx, dy, dz = ext[0].item(), ext[1].item(), ext[2].item()
+                            area = min(dx * dy, dy * dz, dx * dz)
+                        else:
+                            area = gs.EPS
+                        joint_areas.append(area)
+                    self._shared_metadata.kinematic_joint_area = torch.tensor(
+                        joint_areas, dtype=gs.tc_float, device=gs.device
+                    )
+
         # Per-sensor properties
         aabb_world = self._link.get_AABB()
         if aabb_world.ndim == 2:
@@ -616,7 +836,10 @@ class TemperatureGridSensor(
         self._shared_metadata.aabb_extent = concat_with_tensor(
             self._shared_metadata.aabb_extent, aabb_extent, expand=(1, 3), dim=0
         )
-        grid_size_tensor = torch.tensor(self._options.grid_size, dtype=gs.tc_int, device=gs.device)
+        actual_grid_size = (
+            self._effective_grid_size if self._effective_grid_size is not None else self._options.grid_size
+        )
+        grid_size_tensor = torch.tensor(actual_grid_size, dtype=gs.tc_int, device=gs.device)
         self._shared_metadata.grid_size = concat_with_tensor(
             self._shared_metadata.grid_size, grid_size_tensor, expand=(1, 3), dim=0
         )
@@ -646,7 +869,22 @@ class TemperatureGridSensor(
         K2_padded = _compute_K2_rfft3(nx * 2, ny * 2, nz * 2, dx, dy, dz)
         self._shared_metadata.K2_spectral.append(K2_padded)
 
-        surface_mask = _compute_surface_mask(nx, ny, nz)
+        # Build occupancy mask from link collision geometry (if voxel_resolution is set)
+        if self._options.voxel_resolution is not None and self._link.n_geoms > 0:
+            aabb_min_np = aabb_min_local.detach().cpu().numpy().ravel()
+            voxel_size_np = voxel_size.detach().cpu().numpy().ravel()
+            occ = _build_occupancy_mask(self._link, (nx, ny, nz), aabb_min_np, voxel_size_np)
+            self._shared_metadata.occupancy_mask.append(occ)
+            surface_mask = _compute_surface_mask_from_occupancy(occ)
+            n_solid = int(occ.sum().item())
+            n_surface = int(surface_mask.sum().item())
+            gs.logger.info(
+                f"TemperatureGrid on link {self._link.idx}: grid ({nx},{ny},{nz}), "
+                f"{n_solid}/{nx * ny * nz} solid voxels, {n_surface} surface voxels"
+            )
+        else:
+            self._shared_metadata.occupancy_mask.append(None)
+            surface_mask = _compute_surface_mask(nx, ny, nz)
         self._shared_metadata.sensor_surface_mask.append(surface_mask)
 
         if self._options.heat_generation is not None:
@@ -672,6 +910,8 @@ class TemperatureGridSensor(
         )
 
     def _get_return_format(self) -> tuple[tuple[int, ...], ...]:
+        if self._effective_grid_size is not None:
+            return (self._effective_grid_size,)
         return (self._options.grid_size,)
 
     @classmethod
@@ -717,12 +957,15 @@ class TemperatureGridSensor(
             shared_metadata.cache_sizes,
             shared_metadata.grid_size,
             shared_metadata.heat_generation,
+            shared_metadata.occupancy_mask,
             shared_metadata.voxel_size,
             shared_metadata.links_idx,
             shared_metadata.link_to_material_idx,
             link_rho_cp,
             link_conductivity,
+            link_base_temperature,
             shared_metadata.K2_spectral,
+            shared_metadata.ambient_temperature,
             dt,
             shared_ground_truth_cache,
         )
@@ -761,6 +1004,18 @@ class TemperatureGridSensor(
         output.clamp_(-MAX_TEMP, MAX_TEMP)
         if not shared_ground_truth_cache.is_contiguous():
             shared_ground_truth_cache.copy_(output)
+        # 3b) Kinematic conduction between parent-child link pairs
+        if shared_metadata.kinematic_conduction and shared_metadata.kinematic_edges.shape[0] > 0:
+            _apply_kinematic_conduction(
+                shared_metadata.kinematic_edges,
+                shared_metadata.kinematic_joint_area,
+                shared_metadata.link_temps,
+                shared_metadata.link_volume,
+                shared_metadata.link_to_material_idx,
+                link_conductivity,
+                link_rho_cp,
+                dt,
+            )
         # 4) Radiation and convection
         _apply_radiation_convection(
             shared_metadata.sensor_cache_start,

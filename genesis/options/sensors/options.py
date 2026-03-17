@@ -243,6 +243,9 @@ class TemperatureGrid(RigidSensorOptionsMixin, NoisySensorOptionsMixin, SensorOp
     convection_coefficient: float | None = None
     simulate_all_link_temperatures: bool = False
 
+    kinematic_conduction: bool = False
+
+    voxel_resolution: float | None = None
     grid_size: tuple[int, int, int] = (1, 1, 1)
     heat_generation: F3DGridType | None = None
     sensor_time_constant: float = 0.01
