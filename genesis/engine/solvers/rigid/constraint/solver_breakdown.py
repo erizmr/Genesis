@@ -8,7 +8,7 @@ from genesis.engine.solvers.rigid.constraint import solver
 # Number of candidate step sizes evaluated simultaneously per env.
 # Each CUDA block processes one env with K threads, using shared memory for the argmin reduction.
 # Similar to BLOCK_DIM in func_hessian_direct_tiled: determines parallelism and shared memory layout.
-LS_PARALLEL_K = 16
+LS_PARALLEL_K = 32
 
 # Floor for the Newton step estimate used to center the log-spaced search range.
 # When |grad/hess| is near-zero the search range [alpha*1e-2, alpha*1e2] would collapse;
@@ -20,7 +20,7 @@ LS_PARALLEL_MIN_STEP = 1e-6
 # Number of successive refinement passes: after picking the best of K candidates the search
 # range is narrowed around the winner and re-evaluated. 1 pass (K=16 candidates) already
 # gives sufficient resolution; increase for tighter convergence at the cost of more kernels.
-LS_PARALLEL_N_REFINE = 1
+LS_PARALLEL_N_REFINE = 3
 
 # Block sizes for shared-memory reductions in _kernel_parallel_linesearch_p0 and _jv.
 _P0_BLOCK = 32
@@ -46,7 +46,7 @@ def _kernel_parallel_linesearch_mv(
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_d1, i_b in qd.ndrange(n_dofs, _B):
-        if constraint_state.n_constraints[i_b] > 0:
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             I_d1 = [i_d1, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d1
             i_e = dofs_info.entity_idx[I_d1]
             mv = gs.qd_float(0.0)
@@ -67,7 +67,7 @@ def _kernel_parallel_linesearch_jv(
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_c, i_b in qd.ndrange(len_constraints, _B):
-        if i_c < constraint_state.n_constraints[i_b]:
+        if i_c < constraint_state.n_constraints[i_b] and constraint_state.improved[i_b]:
             jv = gs.qd_float(0.0)
             if qd.static(static_rigid_sim_config.sparse_solve):
                 for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
@@ -107,7 +107,7 @@ def _kernel_parallel_linesearch_p0(
         sh_constraint_grad = qd.simt.block.SharedArray((_T,), gs.qd_float)
         sh_constraint_hess = qd.simt.block.SharedArray((_T,), gs.qd_float)
 
-        if constraint_state.n_constraints[i_b] > 0:
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             n_dofs = constraint_state.search.shape[0]
 
             # === Phase 1: Fused snorm + quad_gauss, parallel over n_dofs ===
@@ -151,7 +151,6 @@ def _kernel_parallel_linesearch_p0(
             else:
                 # Thread 0 writes quad_gauss to global memory
                 if tid == 0:
-                    constraint_state.improved[i_b] = True
                     constraint_state.quad_gauss[0, i_b] = constraint_state.gauss[i_b]
                     constraint_state.quad_gauss[1, i_b] = sh_qg_grad[0]
                     constraint_state.quad_gauss[2, i_b] = sh_qg_hess[0]
