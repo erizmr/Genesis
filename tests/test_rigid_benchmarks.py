@@ -195,7 +195,7 @@ def get_file_morph_options(**kwargs):
 
 
 @pytest.fixture(scope="session")
-def stream_writers(printer_session, request):
+def stream_writers(request):
     report_path = Path(request.config.getoption("--speed-test-filepath"))
 
     # Delete old unrelated worker-specific reports
@@ -216,7 +216,7 @@ def stream_writers(printer_session, request):
         report_path.unlink()
     fd = open(report_path, "w")
 
-    yield (lambda msg: print(msg, file=fd, flush=True), printer_session)
+    yield (lambda msg: print(msg, file=fd, flush=True), print)
 
     fd.close()
 
