@@ -245,7 +245,7 @@ def _kernel_parallel_linesearch_p0(
                         total_grad = constraint_state.quad_gauss[1, i_b] + sh_constraint_grad[0]
                         alpha_newton = qd.max(qd.abs(total_grad / total_hess), gs.qd_float(LS_PARALLEL_MIN_STEP))
                         constraint_state.candidates[2, i_b] = alpha_newton * 1e-2
-                        constraint_state.candidates[3, i_b] = alpha_newton * 1e2
+                        constraint_state.candidates[3, i_b] = alpha_newton * 10.0
                     else:
                         constraint_state.candidates[2, i_b] = 1e-6
                         constraint_state.candidates[3, i_b] = 1e2
