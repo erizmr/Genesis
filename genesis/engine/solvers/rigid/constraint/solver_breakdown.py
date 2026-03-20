@@ -376,41 +376,32 @@ def _kernel_parallel_linesearch_eval(
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_linesearch_apply_alpha_dofs(
+def _kernel_parallel_linesearch_apply_alpha(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Apply best alpha to qacc and Ma, parallelized over (dof, env)."""
+    """Apply best alpha to qacc, Ma, and Jaref. Fuses dof and constraint updates."""
     n_dofs = constraint_state.qacc.shape[0]
+    len_constraints = constraint_state.Jaref.shape[0]
     _B = constraint_state.grad.shape[1]
+    n_items = qd.max(n_dofs, len_constraints)
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_d, i_b in qd.ndrange(n_dofs, _B):
+    for i, i_b in qd.ndrange(n_items, _B):
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             alpha = constraint_state.candidates[0, i_b]
             if qd.abs(alpha) < rigid_global_info.EPS[None]:
-                if i_d == 0:
+                if i == 0:
                     constraint_state.improved[i_b] = False
             else:
-                constraint_state.qacc[i_d, i_b] += constraint_state.search[i_d, i_b] * alpha
-                constraint_state.Ma[i_d, i_b] += constraint_state.mv[i_d, i_b] * alpha
-
-
-@qd.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_linesearch_apply_alpha_constraints(
-    constraint_state: array_class.ConstraintState,
-    static_rigid_sim_config: qd.template(),
-):
-    """Apply best alpha to Jaref, parallelized over (constraint, env)."""
-    len_constraints = constraint_state.Jaref.shape[0]
-    _B = constraint_state.grad.shape[1]
-
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_c, i_b in qd.ndrange(len_constraints, _B):
-        if i_c < constraint_state.n_constraints[i_b] and constraint_state.improved[i_b]:
-            alpha = constraint_state.candidates[0, i_b]
-            constraint_state.Jaref[i_c, i_b] += constraint_state.jv[i_c, i_b] * alpha
+                # Apply to dofs
+                if i < n_dofs:
+                    constraint_state.qacc[i, i_b] += constraint_state.search[i, i_b] * alpha
+                    constraint_state.Ma[i, i_b] += constraint_state.mv[i, i_b] * alpha
+                # Apply to constraints
+                if i < constraint_state.n_constraints[i_b]:
+                    constraint_state.Jaref[i, i_b] += constraint_state.jv[i, i_b] * alpha
 
 
 # ============================================== Shared iteration kernels ==============================================
@@ -653,13 +644,9 @@ def func_solve_decomposed(
                 rigid_global_info,
                 static_rigid_sim_config,
             )
-        _kernel_parallel_linesearch_apply_alpha_dofs(
+        _kernel_parallel_linesearch_apply_alpha(
             constraint_state,
             rigid_global_info,
-            static_rigid_sim_config,
-        )
-        _kernel_parallel_linesearch_apply_alpha_constraints(
-            constraint_state,
             static_rigid_sim_config,
         )
         if static_rigid_sim_config.solver_type == gs.constraint_solver.CG:
