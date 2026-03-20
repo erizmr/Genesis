@@ -101,6 +101,35 @@ Instead of `candidates[0]=0, candidates[4]=1e30`, initialize with the Newton ste
 
 **The parallel LS now beats main** — both in FPS and convergence rate. The Newton step provides derivative-guided precision as the baseline, while the grid search adds value at cost function kinks where the Newton approximation breaks down.
 
+### Experiment 1: N_REFINE sweep with Newton initial best
+
+| N_REFINE | active-env-iters | iter0% | iter3% | FPS |
+|----------|-----------------|--------|--------|-----|
+| **1** | **7039** | **16.1%** | **89.3%** | **536k** |
+| 3 | 7059 | 15.2% | 89.0% | 528k |
+| 5 | 7053 | 15.1% | 89.4% | 511k |
+| 7 | 7237 | 15.2% | 88.5% | 499k |
+| 9 | 7237 | 15.2% | 88.5% | 487k |
+
+With Newton initial best, active-env-iters is nearly identical across all N_REFINE (7039-7237). The Newton step provides the precision; the grid search barely improves it. FPS drops with more passes purely from launch overhead. **N_REFINE=1 is optimal** — single eval pass, no refinement needed.
+
+### Experiment 2: Three-way convergence comparison (seed=42)
+
+| iter | **Opt (Newton+tight)** | Previous (tight only) | Main (sequential LS) |
+|------|----------------------|----------------------|---------------------|
+| 0 | **15.2%** (3320 active) | 0.0% (3897 active) | 14.7% (3305 active) |
+| 1 | **46.5%** (2093) | 5.5% (3684) | 44.7% (2144) |
+| 2 | **73.8%** (1024) | 31.7% (2661) | 69.3% (1189) |
+| 3 | **89.0%** (432) | 60.9% (1524) | 88.7% (438) |
+| 4 | **96.6%** (134) | 82.0% (703) | 97.1% (113) |
+| 5 | **98.9%** (45) | 94.0% (235) | 99.4% (23) |
+| 6 | **99.7%** (10) | 98.6% (53) | 99.9% (3) |
+| 7 | 100.0% (1) | 99.8% (9) | 100.0% (0) |
+| **total** | **7059** | **12768** | **7215** |
+| **FPS** | **529k** | **495k** | **517k** |
+
+The Newton initial best (opt) matches main's convergence at every iteration and slightly exceeds it at iters 1-3. The previous best (tight range only) lags significantly — the Newton initial is the critical improvement.
+
 ## Summary
 
 | Config | FPS | vs Main | Active-env-iters |
