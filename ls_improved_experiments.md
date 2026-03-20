@@ -69,7 +69,30 @@ Replaced fixed `N_REFINE=3` with `MAX_REFINE=5` + per-env `needs_refine` flag + 
 | 1A: Parabolic (with validation) | 437k | -16.9% | 10194 |
 | Goal 2: Adaptive MAX_REFINE=5 | 485k | -7.8% | 12742 |
 
-The tight range baseline (one-line change, commit `eb3a421`) is the only improvement that works. Both planned features from `ls_improvement.md` (parabolic interpolation and adaptive refine) are harmful because:
+## Step D: Fuse apply_dofs + apply_constraints — SUCCESS (committed: 32da93f)
+
+Merged two apply kernels into `_kernel_parallel_linesearch_apply_alpha`. Saves 1 launch per iteration.
+FPS: 513k (within noise of baseline). Convergence unchanged.
+
+## Partial Fusion (p0 + eval×N + apply) — FAILED
+
+Attempted to fuse p0 + eval×3 + apply into a single kernel with block syncs between phases.
+
+| Metric | Baseline | Fused (global mem) | Fused (shared mem) |
+|---|---|---|---|
+| FPS | 516k | 519k | 517k |
+| Active-env-iters | 7946 | 12620 | 12655 |
+| iter 0 converged | 13.9% | 0.0% | 0.0% |
+
+FPS improved slightly (fewer launches) but convergence regressed severely (0% at iter 0). Tried two approaches:
+1. Global memory for range communication between eval passes → same bug
+2. Shared memory for all inter-phase communication → same bug
+
+The convergence regression is identical to the earlier fused-eval-only attempt. Root cause unidentified — may be a Quadrants JIT issue with for-loops containing block syncs, or a subtle memory ordering issue. Reverted.
+
+## Summary
+
+The tight range baseline (one-line change, commit `eb3a421`) + fused apply (commit `32da93f`) are the only improvements that work. Both planned features from `ls_improvement.md` (parabolic interpolation and adaptive refine) are harmful because:
 1. The cost function is piecewise (not smooth) — parabolic fit fails at kinks
 2. More refine passes add launch overhead that exceeds any precision benefit
 3. The Quadrants JIT template compilation creates overhead for parameterized kernels
