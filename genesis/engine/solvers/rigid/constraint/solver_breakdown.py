@@ -236,20 +236,25 @@ def _kernel_parallel_linesearch_p0(
                     constraint_state.eq_sum[2, i_b] = sh_qg_hess[0]
                     constraint_state.ls_it[i_b] = 1
                     constraint_state.candidates[1, i_b] = constraint_state.gauss[i_b] + sh_p0_cost[0]
-                    # Initialize best alpha, search range, and best-cost tracker for parallel linesearch
-                    constraint_state.candidates[0, i_b] = 0.0  # default: no step
-
-                    # Use full Newton step (DOF + all constraints) as the range center.
+                    # Use full Newton step as initial best guess + search range center.
                     total_hess = 2.0 * (constraint_state.quad_gauss[2, i_b] + sh_constraint_hess[0])
+                    total_grad = constraint_state.quad_gauss[1, i_b] + sh_constraint_grad[0]
+                    p0_cost_val = constraint_state.gauss[i_b] + sh_p0_cost[0]
+
                     if total_hess > 0.0:
-                        total_grad = constraint_state.quad_gauss[1, i_b] + sh_constraint_grad[0]
                         alpha_newton = qd.max(qd.abs(total_grad / total_hess), gs.qd_float(LS_PARALLEL_MIN_STEP))
+                        # Initialize with Newton step as the best alpha so far.
+                        # Its quadratic-approximated cost is p0 - grad²/(2*hess), always < p0.
+                        newton_cost = p0_cost_val - 0.5 * total_grad * total_grad / total_hess
+                        constraint_state.candidates[0, i_b] = alpha_newton
+                        constraint_state.candidates[4, i_b] = newton_cost
                         constraint_state.candidates[2, i_b] = alpha_newton * 1e-2
                         constraint_state.candidates[3, i_b] = alpha_newton * 10.0
                     else:
+                        constraint_state.candidates[0, i_b] = 0.0
+                        constraint_state.candidates[4, i_b] = gs.qd_float(1e30)
                         constraint_state.candidates[2, i_b] = 1e-6
                         constraint_state.candidates[3, i_b] = 1e2
-                    constraint_state.candidates[4, i_b] = gs.qd_float(1e30)  # best cost across passes
 
 
 @qd.kernel(fastcache=gs.use_fastcache)
