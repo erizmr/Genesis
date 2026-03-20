@@ -76,7 +76,15 @@ N_REFINE=8, 10, 12 produce **identical** per-iteration convergence (same active 
 
 The remaining gap: 11603 → 7298 active-env-iters (37% more). This is the grid search choosing the wrong side of cost function kinks at the initial pass, which no refinement can fix.
 
-**Conclusion**: The precision gap is fundamental to the grid search's initial bracket, not its resolution.
+**Investigation**: Verified that the cost function computation is mathematically identical between the parallel and sequential LS. The gap is not from different objectives. The grid search converges to the correct grid minimum to machine precision (N=8,10,12 identical). But the grid minimum is not the true function minimum when:
+
+1. A contact activation kink (`Jaref + alpha*jv = 0`) falls between two grid points
+2. The true minimum is AT the kink (where the cost function is non-differentiable)
+3. The grid search evaluates both sides but picks the one with lower cost — the true minimum at the kink itself is never evaluated
+
+The sequential LS handles this via derivative-guided bracketing: the derivative changes sign at the kink, so the bracket correctly captures it. ~18 kinks per env (from contact constraints), K=32 grid points over 3 decades.
+
+**Conclusion**: The precision gap is fundamental to the grid search's discrete sampling at cost function kinks.
 
 ## Summary
 
