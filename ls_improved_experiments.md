@@ -66,15 +66,17 @@ Tested N_REFINE = 3, 4, 5, 6, 8 with fixed seed (torch.manual_seed(42)):
 | N_REFINE | active-env-iters | vs N=3 | iter1 conv% | iter3 conv% | FPS |
 |----------|-----------------|--------|-------------|-------------|-----|
 | 3 | 12768 | — | 5.5% | 60.9% | 497k |
-| 4 | 11938 | -6.5% | | | 495k |
-| 5 | 11557 | -9.5% | | | 488k |
-| 6 | 11610 | -9.1% | 15.9% | 65.3% | 484k |
-| 8 | 11603 | -9.1% | | | 471k |
+| 5 | 11557 | -9.5% | 16.6% | 66.4% | 488k |
+| **8** | **11603** | **-9.1%** | **15.9%** | **65.6%** | **471k** |
+| **10** | **11603** | **-9.1%** | **15.9%** | **65.6%** | **459k** |
+| **12** | **11603** | **-9.1%** | **15.9%** | **65.6%** | **448k** |
 | **Main** | **~7298** | **-43%** | **44.0%** | **88.7%** | **526k** |
 
-**Finding**: More refine passes improve precision by ~9% (N=3→5) then plateau. Even N=8 can't get below 11500 active-env-iters — far from main's 7298. The grid search saturates because the initial bracket determines which side of a cost function kink the refinement converges to, regardless of how many passes narrow the bracket.
+N_REFINE=8, 10, 12 produce **identical** per-iteration convergence (same active counts to the last env). Precision completely plateaus at N_REFINE≈8 — further passes find the exact same alpha every time.
 
-**Conclusion**: The precision gap is fundamental to the grid search approach, not a resolution issue.
+The remaining gap: 11603 → 7298 active-env-iters (37% more). This is the grid search choosing the wrong side of cost function kinks at the initial pass, which no refinement can fix.
+
+**Conclusion**: The precision gap is fundamental to the grid search's initial bracket, not its resolution.
 
 ## Summary
 
