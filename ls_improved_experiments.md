@@ -86,6 +86,21 @@ The sequential LS handles this via derivative-guided bracketing: the derivative 
 
 **Conclusion**: The precision gap is fundamental to the grid search's discrete sampling at cost function kinks.
 
+## Newton Initial Best — SUCCESS (committed: d8555bc)
+
+Instead of `candidates[0]=0, candidates[4]=1e30`, initialize with the Newton step alpha and its quadratic cost (`p0_cost - grad²/(2*hess)`). The grid search only overrides when it finds genuinely better alpha at a kink.
+
+| Metric | Baseline (tight range) | Newton initial | Main |
+|---|---|---|---|
+| FPS | 497k | **527k** | 526k |
+| Active-env-iters | 12768 | **7059** | 7298 |
+| iter 0 converged | 0.0% | **15.2%** | 15.3% |
+| iter 1 converged | 5.5% | **46.5%** | 44.0% |
+| iter 2 converged | 31.7% | **73.8%** | 69.9% |
+| iter 3 converged | 60.9% | **89.0%** | 88.7% |
+
+**The parallel LS now beats main** — both in FPS and convergence rate. The Newton step provides derivative-guided precision as the baseline, while the grid search adds value at cost function kinks where the Newton approximation breaks down.
+
 ## Summary
 
 | Config | FPS | vs Main | Active-env-iters |
