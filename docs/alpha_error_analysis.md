@@ -2,72 +2,74 @@
 
 ## Setup
 
-- Benchmark: g1_fall, 4096 envs, step 276 (after 275 warmup)
-- Gold standard: exhaustive search over 100,000 log-spaced alphas
+- Benchmark: g1_fall, 4096 envs, step 276 (after 275 warmup), single solver iteration
+- Gold standard: **iterative Newton linesearch** (3-phase bracketing, matching `func_linesearch_batch`)
+- Cross-check: exhaustive 100K-point search confirms Newton LS is near-optimal (3.4e-5 median error)
 - Sample: 500 envs with constraints
-- Error metric: `|alpha_parallel - alpha_gold| / |alpha_gold|` (relative error)
-- Sweep: K ∈ {4, 8, 16, 32, 64}, N_REFINE ∈ {1, 2, 3, 5, 8}
+- Error metric: `|alpha_parallel - alpha_iterative| / |alpha_iterative|`
+- Sweep: K ∈ {4, 8, 16, 32, 64}, N_REFINE ∈ {1, 3, 5, 8}
 
-## Key Finding: Newton initial dominates precision
+## Is the iterative Newton LS the best alpha?
 
-With Newton initial best enabled, the grid search barely improves the alpha. The Newton step alone gives 0.76% median error. Adding K=32 × 3 refine passes only reduces it to 0.56%. The p90 and p99 error are **unchanged** at 22.6% and 53.7% — these are the envs where the Newton approximation is poor (near kinks), and the grid search can't help because it searches a region centered on the same Newton estimate.
+**Yes.** Compared against a 100,000-point exhaustive search:
+- Median error: 3.4e-05 (0.003%)
+- p90 error: 5.1e-05
+- The iterative Newton LS finds alphas within 0.003% of the true optimum.
 
-Without Newton initial, the grid-only search shows clear improvement with both K and N_REFINE, but converges to a much worse floor (~0.003% median with K=64, N=8 vs 0.004% with K=32, N=8).
+## Results: Parallel LS error vs iterative Newton LS
 
-## Results: WITH Newton initial best
-
-```
-   K N_REF |  median_err   p90_err      p99_err
-   4     1 |  7.60e-03    2.26e-01    5.37e-01
-   4     8 |  7.60e-03    2.26e-01    5.37e-01    ← N_REFINE has zero effect at K=4
-  16     1 |  7.60e-03    2.26e-01    5.37e-01
-  16     8 |  6.04e-03    2.26e-01    5.37e-01    ← marginal median improvement
-  32     1 |  7.77e-03    2.26e-01    5.37e-01
-  32     3 |  5.58e-03    2.26e-01    5.37e-01    ← current config
-  32     8 |  5.58e-03    2.26e-01    5.37e-01    ← saturated
-  64     3 |  9.21e-04    2.26e-01    5.37e-01    ← 5x better median
-  64     8 |  9.21e-04    2.26e-01    5.37e-01    ← saturated
-Newton only |  7.60e-03    2.26e-01    5.37e-01    ← grid adds almost nothing!
-```
-
-**Interpretation**: The Newton step is already very close to the true minimum for ~50% of envs (median error 0.76%). The grid search shaves a few basis points off the median but cannot help the worst cases (p90/p99) because those envs have kinks near the Newton estimate and the grid is too coarse to find the kink-point minimum.
-
-## Results: WITHOUT Newton initial (grid only)
+### WITH Newton initial best (current method)
 
 ```
-   K N_REF |  median_err   p90_err      p99_err
-   8     1 |  3.90e-01    4.71e-01    4.84e-01    ← terrible, 39% median error
-   8     3 |  2.42e-02    3.21e-02    4.41e-02
-   8     8 |  5.37e-05    1.53e-03    1.08e-02    ← 8 passes needed for K=8
-  16     1 |  7.60e-03    1.70e-01    2.71e-01
-  16     3 |  1.35e-03    5.01e-03    1.37e-02
-  32     1 |  7.68e-02    1.00e-01    1.27e-01
-  32     3 |  2.40e-04    3.75e-04    4.83e-04    ← 0.024% median
-  32     5 |  3.44e-05    5.20e-05    2.05e-04    ← saturated at N=5
-  64     3 |  4.57e-05    1.63e-04    7.60e-04
-  64     8 |  4.08e-05    1.63e-04    7.60e-04    ← saturated
+   K  N_REF |  median      mean       p90         p99       exact(<1e-6)
+   4      1 | 7.57e-03   7.06e-02   2.26e-01   6.09e-01    15.4%
+   4      8 | 7.57e-03   7.06e-02   2.26e-01   6.09e-01    15.4%   ← N has no effect at K=4
+   8      1 | 7.57e-03   7.06e-02   2.26e-01   6.09e-01    15.4%
+   8      8 | 7.57e-03   7.06e-02   2.26e-01   6.09e-01    15.4%   ← same as K=4
+  16      3 | 5.99e-03   7.00e-02   2.26e-01   6.09e-01    15.4%
+  32      1 | 7.78e-03   7.14e-02   2.26e-01   6.09e-01    15.4%
+  32      3 | 5.57e-03   7.00e-02   2.26e-01   6.09e-01    15.4%   ← current config
+  32      8 | 5.57e-03   7.00e-02   2.26e-01   6.09e-01    18.2%   ← saturated
+  64      3 | 8.97e-04   6.91e-02   2.26e-01   6.09e-01    15.4%   ← 6x better median
+  64      8 | 8.97e-04   6.91e-02   2.26e-01   6.09e-01    36.2%
+  Newton step only (no grid):
+             | 7.57e-03   7.06e-02   2.26e-01   6.09e-01    15.4%   ← grid adds almost nothing
 ```
 
-**Interpretation**: Without Newton initial, precision depends strongly on K and N_REFINE:
-- K=32, N=3 (our previous config without Newton): 0.024% median — good but ~50x worse than Newton-seeded
-- K=32, N=5+: saturates at 0.003% — diminishing returns from refinement
-- K=64 helps at low N_REFINE but saturates at the same floor
+**Observation**: 15.4% of envs match the iterative LS exactly — these are envs where Phase 1 (one Newton step) already converges. The p90/p99 are **immovable** at 22.6%/60.9% regardless of K or N_REFINE.
 
-## Error distribution shape
+### WITHOUT Newton initial (grid only)
 
-The error distribution is bimodal:
-- **~50% of envs**: Newton step is near-exact (error < 1%). These are smooth-cost envs.
-- **~25% of envs**: Moderate error (1-10%). Grid search helps here.
-- **~25% of envs**: High error (10-50%+). These have kink-point minima that neither Newton nor grid can reach precisely. The grid search barely helps because the kink alpha `-Jaref/jv` is not among the candidates.
+```
+   K  N_REF |  median      mean       p90         p99       exact(<1e-6)
+   8      1 | 3.90e-01   3.96e-01   4.71e-01   4.84e-01     0.0%
+   8      8 | 5.13e-05   1.90e-03   1.54e-03   1.33e-02     1.2%
+  16      8 | 2.32e-06   2.79e-03   5.29e-03   1.47e-02    48.8%
+  32      3 | 2.47e-04   1.59e-03   3.94e-04   4.62e-04     0.2%
+  32      5 | 1.02e-06   1.37e-03   1.80e-06   2.27e-04    49.6%
+  32      8 | 5.34e-08   1.37e-03   1.95e-07   2.25e-04    94.0%  ← 94% exact!
+  64      5 | 8.20e-08   1.40e-03   1.48e-04   7.81e-04    83.2%
+  64      8 | 7.57e-08   1.40e-03   1.48e-04   7.81e-04    83.2%
+```
+
+Grid-only with enough passes CAN reach high precision: K=32, N=8 achieves 94% exact matches. But p99 stays at 0.023% — a small fraction of envs have kink minima the grid can't resolve.
+
+## Error distribution
+
+| Category | % of envs | Newton step error | What happens |
+|---|---|---|---|
+| Phase-1 converged | ~15% | < 1e-6 (exact) | Single Newton step = iterative LS result |
+| Near-smooth | ~60% | 0.1-2% | Iterative LS needs 2-5 inner iterations; grid is close but not exact |
+| Kink-dominated | ~25% | 10-60% | Iterative LS uses bracketing; grid/Newton both overshoot |
 
 ## Conclusions
 
-1. **Newton initial is the dominant factor.** It provides 0.76% median error for free (no kernel launch). The grid search reduces this to 0.56% with K=32, N=3 — a marginal improvement.
+1. **The iterative Newton LS is near-optimal** — validated against exhaustive search (0.003% median error).
 
-2. **Grid-only precision scales as ~O(1/K^N_REFINE)** in the median, but has a hard floor set by kink-point minima that the grid never evaluates.
+2. **The p0 Newton step (one step, no iteration) matches the iterative LS for 15.4% of envs exactly.** These are the "easy" envs where the iterative LS also converges in Phase 1.
 
-3. **Increasing K is more effective than increasing N_REFINE** for Newton-seeded search (K=64 gives 5x improvement, N_REFINE gives ~1.3x).
+3. **Grid search adds marginal median precision** when Newton initial is used (7.57e-3 → 5.57e-3 with K=32,N=3). The p90/p99 are unchanged — the grid cannot replicate the iterative LS's multi-step bracketing.
 
-4. **The grid search's value is NOT in median precision** (Newton handles that) but in the ~25% of envs where the Newton approximation breaks down at kinks. However, even K=64, N=8 can't reduce the p90 error below 22.6%.
+4. **Grid-only (no Newton) CAN achieve 94% exact match** with K=32,N=8, but at heavy launch overhead cost. The median error drops exponentially with N_REFINE.
 
-5. **To improve the worst-case envs**, the grid would need to include kink alphas (`-Jaref[i_c]/jv[i_c]`) as candidates. With ~18 kinks per env and K=32, this is feasible but would require a fundamentally different candidate selection strategy.
+5. **The combined approach (Newton initial + grid) is the practical optimum**: Newton handles the 75% smooth cases, grid provides safety-net. The remaining 25% "kink-dominated" envs would need kink-alpha candidates (`-Jaref/jv`) to improve.
