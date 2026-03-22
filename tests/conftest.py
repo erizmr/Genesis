@@ -478,6 +478,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 @pytest.fixture(scope="session")
+def printer_session():
+    """Fallback fixture for printer_session when the internal plugin is not installed."""
+    return print
+
+
+@pytest.fixture(scope="session")
 def show_viewer(pytestconfig):
     return pytestconfig.getoption("--vis", IS_INTERACTIVE_VIEWER_AVAILABLE)
 
