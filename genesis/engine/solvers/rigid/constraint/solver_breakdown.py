@@ -444,16 +444,27 @@ def _kernel_parallel_linesearch_eval(
                     constraint_state.candidates[2, i_b] = qd.exp(qd.log(lo) + qd.cast(lo_idx, gs.qd_float) * _step)
                     constraint_state.candidates[3, i_b] = qd.exp(qd.log(lo) + qd.cast(hi_idx, gs.qd_float) * _step)
 
-                # On last pass: gradient check + Newton correction
+                # On last pass: gradient check + Newton correction + Branch A
                 if qd.static(_is_last_pass):
                     final_alpha = constraint_state.candidates[0, i_b]
-                    if qd.abs(final_alpha) > rigid_global_info.EPS[None]:
-                        gtol = constraint_state.candidates[7, i_b]
+                    gtol = constraint_state.candidates[7, i_b]
+
+                    if qd.abs(final_alpha) < rigid_global_info.EPS[None]:
+                        # Branch A: grid found no improvement. Check grad(0).
+                        grad_0, hess_0 = _ls_compute_grad_hess(gs.qd_float(0.0), i_b, constraint_state)
+                        if grad_0 < -gtol and hess_0 > rigid_global_info.EPS[None]:
+                            # Cost descending at alpha=0 → Newton step from 0
+                            alpha_n = -grad_0 / hess_0
+                            alpha_n = qd.min(alpha_n, gs.qd_float(LS_ALPHA_MAX))
+                            if alpha_n > 0.0:
+                                constraint_state.candidates[0, i_b] = alpha_n
+                    else:
+                        # Branch B: improvement found. Gradient check + Newton.
                         grad_val, hess_val = _ls_compute_grad_hess(final_alpha, i_b, constraint_state)
 
-                        # Newton correction if gradient is not near zero
                         if qd.abs(grad_val) > gtol and hess_val > rigid_global_info.EPS[None]:
                             alpha_corrected = final_alpha - grad_val / hess_val
+                            alpha_corrected = qd.min(qd.max(alpha_corrected, gs.qd_float(0.0)), gs.qd_float(LS_ALPHA_MAX))
                             if alpha_corrected > 0.0:
                                 constraint_state.candidates[0, i_b] = alpha_corrected
             else:
