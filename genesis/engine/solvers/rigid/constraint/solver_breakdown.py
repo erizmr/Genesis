@@ -26,6 +26,60 @@ LS_PARALLEL_N_REFINE = 1
 _P0_BLOCK = 32
 _JV_BLOCK = 32
 
+# Maximum allowed alpha (prevents divergence from degenerate Newton steps)
+LS_ALPHA_MAX = 1e4
+# Maximum bisection iterations (2^8 = 256x precision improvement)
+LS_BISECT_STEPS = 8
+# Range expansion: max steps and growth factor
+LS_EXPANSION_STEPS = 6
+LS_EXPANSION_FACTOR = 4.0
+
+
+@qd.func
+def _ls_compute_grad_hess(
+    alpha,
+    i_b,
+    constraint_state: array_class.ConstraintState,
+):
+    """Compute analytical gradient and hessian of the linesearch cost at alpha.
+
+    Accumulates quadratic coefficients with alpha-dependent constraint activation.
+    Returns (grad, hess).
+    """
+    ne = constraint_state.n_constraints_equality[i_b]
+    nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+    n_con = constraint_state.n_constraints[i_b]
+
+    g1 = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b]
+    g2 = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b]
+
+    for i_c in range(ne, nef):
+        Jaref_c = constraint_state.Jaref[i_c, i_b]
+        jv_c = constraint_state.jv[i_c, i_b]
+        D = constraint_state.efc_D[i_c, i_b]
+        f_val = constraint_state.efc_frictionloss[i_c, i_b]
+        r_val = constraint_state.diag[i_c, i_b]
+        x = Jaref_c + alpha * jv_c
+        rf = r_val * f_val
+        if x <= -rf or x >= rf:
+            g1 += (x <= -rf) * (-f_val * jv_c) + (x >= rf) * (f_val * jv_c)
+        else:
+            g1 += D * jv_c * Jaref_c
+            g2 += D * 0.5 * jv_c * jv_c
+
+    for i_c in range(nef, n_con):
+        Jaref_c = constraint_state.Jaref[i_c, i_b]
+        jv_c = constraint_state.jv[i_c, i_b]
+        D = constraint_state.efc_D[i_c, i_b]
+        x = Jaref_c + alpha * jv_c
+        if x < 0:
+            g1 += D * jv_c * Jaref_c
+            g2 += D * 0.5 * jv_c * jv_c
+
+    grad = 2.0 * alpha * g2 + g1
+    hess = 2.0 * g2
+    return grad, hess
+
 
 @qd.kernel(fastcache=gs.use_fastcache)
 def _kernel_parallel_linesearch_mv(
@@ -390,44 +444,12 @@ def _kernel_parallel_linesearch_eval(
                     constraint_state.candidates[2, i_b] = qd.exp(qd.log(lo) + qd.cast(lo_idx, gs.qd_float) * _step)
                     constraint_state.candidates[3, i_b] = qd.exp(qd.log(lo) + qd.cast(hi_idx, gs.qd_float) * _step)
 
-                # On last pass: analytical gradient check + Newton correction
+                # On last pass: gradient check + Newton correction
                 if qd.static(_is_last_pass):
                     final_alpha = constraint_state.candidates[0, i_b]
                     if qd.abs(final_alpha) > rigid_global_info.EPS[None]:
                         gtol = constraint_state.candidates[7, i_b]
-                        ne_g = constraint_state.n_constraints_equality[i_b]
-                        nef_g = ne_g + constraint_state.n_constraints_frictionloss[i_b]
-                        n_con_g = constraint_state.n_constraints[i_b]
-
-                        # Accumulate gradient and hessian coefficients at final_alpha
-                        g1 = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b]
-                        g2 = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b]
-
-                        for i_cg in range(ne_g, nef_g):
-                            Jaref_c = constraint_state.Jaref[i_cg, i_b]
-                            jv_c = constraint_state.jv[i_cg, i_b]
-                            D = constraint_state.efc_D[i_cg, i_b]
-                            f_val = constraint_state.efc_frictionloss[i_cg, i_b]
-                            r_val = constraint_state.diag[i_cg, i_b]
-                            x = Jaref_c + final_alpha * jv_c
-                            rf = r_val * f_val
-                            if x <= -rf or x >= rf:
-                                g1 += (x <= -rf) * (-f_val * jv_c) + (x >= rf) * (f_val * jv_c)
-                            else:
-                                g1 += D * jv_c * Jaref_c
-                                g2 += D * 0.5 * jv_c * jv_c
-
-                        for i_cg in range(nef_g, n_con_g):
-                            Jaref_c = constraint_state.Jaref[i_cg, i_b]
-                            jv_c = constraint_state.jv[i_cg, i_b]
-                            D = constraint_state.efc_D[i_cg, i_b]
-                            x = Jaref_c + final_alpha * jv_c
-                            if x < 0:
-                                g1 += D * jv_c * Jaref_c
-                                g2 += D * 0.5 * jv_c * jv_c
-
-                        grad_val = 2.0 * final_alpha * g2 + g1
-                        hess_val = 2.0 * g2
+                        grad_val, hess_val = _ls_compute_grad_hess(final_alpha, i_b, constraint_state)
 
                         # Newton correction if gradient is not near zero
                         if qd.abs(grad_val) > gtol and hess_val > rigid_global_info.EPS[None]:
