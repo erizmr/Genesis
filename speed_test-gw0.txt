@@ -1,1 +1,1 @@
-env=g1_fall 	| batch_size=4096 	| constraint_solver=Newton 	| use_contact_island=False 	| dtype=ndarray 	| backend=cuda 	| compile_time=23.2 	| runtime_fps=514712.0 	| realtime_factor=2573.6
+env=g1_fall 	| batch_size=4096 	| constraint_solver=Newton 	| use_contact_island=False 	| dtype=ndarray 	| backend=cuda 	| compile_time=22.1 	| runtime_fps=561691.0 	| realtime_factor=2808.5
