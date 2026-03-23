@@ -17,11 +17,6 @@ LS_PARALLEL_K = 32
 # masks a genuinely small optimal step.
 LS_PARALLEL_MIN_STEP = 1e-6
 
-# Number of successive refinement passes: after picking the best of K candidates the search
-# range is narrowed around the winner and re-evaluated. 1 pass (K=16 candidates) already
-# gives sufficient resolution; increase for tighter convergence at the cost of more kernels.
-LS_PARALLEL_N_REFINE = 1
-
 # Block sizes for shared-memory reductions in _kernel_parallel_linesearch_p0 and _jv.
 _P0_BLOCK = 32
 _JV_BLOCK = 32
@@ -317,13 +312,12 @@ def _kernel_parallel_linesearch_eval(
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
-    _is_last_pass: qd.template(),
 ):
-    """Evaluate K candidate alphas in parallel per env, pick the best via reduction.
+    """Evaluate K candidate alphas, pick the best, then apply gradient-guided refinement.
 
-    Reads the search range from candidates[2] (lo) and candidates[3] (hi).
-    Writes narrowed range back to candidates[2,3] for successive refinement.
-    On the last pass, computes analytical gradient at best_alpha and does one
+    Phase 1: K threads evaluate log-spaced candidates (thread 0 = Newton alpha).
+    Phase 2: Argmin reduction to find lowest-cost candidate.
+    Phase 3: Thread 0 computes analytical gradient at best_alpha and does one
     Newton correction step if |grad| > gtol.
     """
     _B = constraint_state.grad.shape[1]
@@ -444,29 +438,28 @@ def _kernel_parallel_linesearch_eval(
                     constraint_state.candidates[2, i_b] = qd.exp(qd.log(lo) + qd.cast(lo_idx, gs.qd_float) * _step)
                     constraint_state.candidates[3, i_b] = qd.exp(qd.log(lo) + qd.cast(hi_idx, gs.qd_float) * _step)
 
-                # On last pass: gradient check + Newton correction + Branch A
-                if qd.static(_is_last_pass):
-                    final_alpha = constraint_state.candidates[0, i_b]
-                    gtol = constraint_state.candidates[7, i_b]
+                # --- Gradient-guided refinement (thread 0) ---
+                final_alpha = constraint_state.candidates[0, i_b]
+                gtol = constraint_state.candidates[7, i_b]
 
-                    if qd.abs(final_alpha) < rigid_global_info.EPS[None]:
-                        # Branch A: grid found no improvement. Check grad(0).
-                        grad_0, hess_0 = _ls_compute_grad_hess(gs.qd_float(0.0), i_b, constraint_state)
-                        if grad_0 < -gtol and hess_0 > rigid_global_info.EPS[None]:
-                            # Cost descending at alpha=0 → Newton step from 0
-                            alpha_n = -grad_0 / hess_0
-                            alpha_n = qd.min(alpha_n, gs.qd_float(LS_ALPHA_MAX))
-                            if alpha_n > 0.0:
-                                constraint_state.candidates[0, i_b] = alpha_n
-                    else:
-                        # Branch B: improvement found. Gradient check + Newton.
-                        grad_val, hess_val = _ls_compute_grad_hess(final_alpha, i_b, constraint_state)
+                if qd.abs(final_alpha) < rigid_global_info.EPS[None]:
+                    # Branch A: grid found no improvement. Check grad(0).
+                    grad_0, hess_0 = _ls_compute_grad_hess(gs.qd_float(0.0), i_b, constraint_state)
+                    if grad_0 < -gtol and hess_0 > rigid_global_info.EPS[None]:
+                        # Cost descending at alpha=0 → Newton step from 0
+                        alpha_n = -grad_0 / hess_0
+                        alpha_n = qd.min(alpha_n, gs.qd_float(LS_ALPHA_MAX))
+                        if alpha_n > 0.0:
+                            constraint_state.candidates[0, i_b] = alpha_n
+                else:
+                    # Branch B: improvement found. Gradient check + Newton correction.
+                    grad_val, hess_val = _ls_compute_grad_hess(final_alpha, i_b, constraint_state)
 
-                        if qd.abs(grad_val) > gtol and hess_val > rigid_global_info.EPS[None]:
-                            alpha_corrected = final_alpha - grad_val / hess_val
-                            alpha_corrected = qd.min(qd.max(alpha_corrected, gs.qd_float(0.0)), gs.qd_float(LS_ALPHA_MAX))
-                            if alpha_corrected > 0.0:
-                                constraint_state.candidates[0, i_b] = alpha_corrected
+                    if qd.abs(grad_val) > gtol and hess_val > rigid_global_info.EPS[None]:
+                        alpha_corrected = final_alpha - grad_val / hess_val
+                        alpha_corrected = qd.min(qd.max(alpha_corrected, gs.qd_float(0.0)), gs.qd_float(LS_ALPHA_MAX))
+                        if alpha_corrected > 0.0:
+                            constraint_state.candidates[0, i_b] = alpha_corrected
             else:
                 constraint_state.candidates[0, i_b] = 0.0
 
@@ -733,14 +726,12 @@ def func_solve_decomposed(
             rigid_global_info,
             static_rigid_sim_config,
         )
-        # Successive refinement: last pass includes gradient check + Newton correction.
-        for _refine in range(LS_PARALLEL_N_REFINE):
-            _kernel_parallel_linesearch_eval(
-                constraint_state,
-                rigid_global_info,
-                static_rigid_sim_config,
-                _refine == LS_PARALLEL_N_REFINE - 1,
-            )
+        # Grid search + gradient-guided Newton correction (single pass)
+        _kernel_parallel_linesearch_eval(
+            constraint_state,
+            rigid_global_info,
+            static_rigid_sim_config,
+        )
         _kernel_parallel_linesearch_apply_alpha(
             constraint_state,
             rigid_global_info,
