@@ -165,6 +165,7 @@ ignore = [
 ]
 
 [tool.pytest.ini_options]
+norecursedirs = ["experiments", "refs", "traces"]
 addopts = [
     "--verbose",
     "-r", "a",
