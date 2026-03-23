@@ -20,7 +20,7 @@ LS_PARALLEL_MIN_STEP = 1e-6
 # Number of successive refinement passes: after picking the best of K candidates the search
 # range is narrowed around the winner and re-evaluated. 1 pass (K=16 candidates) already
 # gives sufficient resolution; increase for tighter convergence at the cost of more kernels.
-LS_PARALLEL_N_REFINE = 3
+LS_PARALLEL_N_REFINE = 1
 
 # Block sizes for shared-memory reductions in _kernel_parallel_linesearch_p0 and _jv.
 _P0_BLOCK = 32
