@@ -873,9 +873,7 @@ def func_solve_decomposed(
 
 
 @solver.func_solve_body.register(
-    is_compatible=lambda *args, **kwargs: (
-        gs.backend in {gs.cuda} and not (args[5] if len(args) > 5 else kwargs["static_rigid_sim_config"]).requires_grad
-    )
+    is_compatible=lambda *args, **kwargs: False  # Disabled to benchmark parallel LS in isolation
 )
 def func_solve_decomposed_sequential(
     entities_info,
