@@ -488,15 +488,39 @@ def _kernel_parallel_linesearch_eval(
                 sh_cand_alpha[0] = best_alpha
             qd.simt.block.sync()
 
-            # === Phase 3: Cooperative gradient bisection ===
-            best_alpha_shared = sh_cand_alpha[0]
-            if best_alpha_shared > 0.0:
-                # Cooperatively compute gradient at best_alpha
-                alpha_eval = best_alpha_shared
+            # === Phase 3: Fully cooperative gradient bisection ===
+            # All K threads participate in cost+gradient reduction at each bisection midpoint.
+            # Thread 0 broadcasts the evaluation alpha via sh_cand_alpha[0]; all threads read it.
 
-                # Cooperative gradient: accumulate quad_total_1 and quad_total_2
-                local_qt1 = gs.qd_float(0.0)
-                local_qt2 = gs.qd_float(0.0)
+            best_alpha_shared = sh_cand_alpha[0]
+
+            # Cooperative cost+gradient evaluation helper pattern:
+            # 1. Thread 0 writes alpha to sh_cand_alpha[0]
+            # 2. All threads cooperatively reduce constraint quad coefficients
+            # 3. Thread 0 reads reduced qt1/qt2 to compute grad and cost
+            _N_BISECT = qd.static(LS_BISECT_STEPS)
+            for _bis_step in range(_N_BISECT + 1):
+                # Thread 0 decides which alpha to evaluate and writes to shared memory
+                if tid == 0:
+                    if _bis_step == 0:
+                        # First iteration: evaluate gradient at best_alpha from grid
+                        sh_cand_alpha[1] = best_alpha_shared  # alpha to evaluate
+                        sh_cand_alpha[2] = best_alpha_shared * 0.5  # bis_a init (overshot bracket)
+                        sh_cand_alpha[3] = best_alpha_shared * 2.0  # bis_b init (undershot bracket)
+                    # sh_cand_alpha[4] will store: 0=continue, 1=done
+                qd.simt.block.sync()
+
+                if best_alpha_shared <= 0.0:
+                    # No improvement from grid — skip bisection entirely
+                    qd.simt.block.sync()  # match the sync at end of loop body
+                    break
+
+                alpha_eval = sh_cand_alpha[1]
+
+                # All threads cooperatively compute cost + quad coefficients at alpha_eval
+                local_cost_bis = gs.qd_float(0.0)
+                local_qt1_bis = gs.qd_float(0.0)
+                local_qt2_bis = gs.qd_float(0.0)
                 i_c = ne + tid
                 while i_c < n_con:
                     Jaref_c = constraint_state.Jaref[i_c, i_b]
@@ -512,61 +536,90 @@ def _kernel_parallel_linesearch_eval(
                         qf_1 = D * (jv_c * Jaref_c)
                         qf_2 = D * (0.5 * jv_c * jv_c)
                         if linear_neg or linear_pos:
+                            local_cost_bis = local_cost_bis + linear_neg * f_val * (-0.5 * rf - Jaref_c - alpha_eval * jv_c)
+                            local_cost_bis = local_cost_bis + linear_pos * f_val * (-0.5 * rf + Jaref_c + alpha_eval * jv_c)
                             qf_1 = linear_neg * (-f_val * jv_c) + linear_pos * (f_val * jv_c)
                             qf_2 = 0.0
-                        local_qt1 = local_qt1 + qf_1
-                        local_qt2 = local_qt2 + qf_2
+                        else:
+                            local_cost_bis = local_cost_bis + D * 0.5 * x * x
+                        local_qt1_bis = local_qt1_bis + qf_1
+                        local_qt2_bis = local_qt2_bis + qf_2
                     else:
+                        if x < 0:
+                            local_cost_bis = local_cost_bis + D * 0.5 * x * x
                         act = x < 0
-                        local_qt1 = local_qt1 + D * (jv_c * Jaref_c) * act
-                        local_qt2 = local_qt2 + D * (0.5 * jv_c * jv_c) * act
+                        local_qt1_bis = local_qt1_bis + D * (jv_c * Jaref_c) * act
+                        local_qt2_bis = local_qt2_bis + D * (0.5 * jv_c * jv_c) * act
                     i_c += _K
 
-                # Reduce qt1 and qt2
-                sh_val[tid] = local_qt1
-                sh_val2[tid] = local_qt2
+                # Tree reduction for cost, qt1, qt2 (reuse sh_val, sh_val2, sh_cand_cost)
+                sh_val[tid] = local_qt1_bis
+                sh_val2[tid] = local_qt2_bis
+                sh_cand_cost[tid] = local_cost_bis
                 qd.simt.block.sync()
                 stride = _K // 2
                 while stride > 0:
                     if tid < stride:
                         sh_val[tid] += sh_val[tid + stride]
                         sh_val2[tid] += sh_val2[tid + stride]
+                        sh_cand_cost[tid] += sh_cand_cost[tid + stride]
                     qd.simt.block.sync()
                     stride //= 2
 
+                # Thread 0: compute grad, decide next bisection step
                 if tid == 0:
-                    qt1_total = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b] + sh_val[0]
-                    qt2_total = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b] + sh_val2[0]
-                    g_best = 2.0 * alpha_eval * qt2_total + qt1_total
+                    qt1_t = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b] + sh_val[0]
+                    qt2_t = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b] + sh_val2[0]
+                    dof_eq_c = (
+                        alpha_eval * alpha_eval * constraint_state.quad_gauss[2, i_b]
+                        + alpha_eval * constraint_state.quad_gauss[1, i_b]
+                        + constraint_state.quad_gauss[0, i_b]
+                        + alpha_eval * alpha_eval * constraint_state.eq_sum[2, i_b]
+                        + alpha_eval * constraint_state.eq_sum[1, i_b]
+                        + constraint_state.eq_sum[0, i_b]
+                    )
+                    c_eval = dof_eq_c + sh_cand_cost[0]
+                    g_eval = 2.0 * alpha_eval * qt2_t + qt1_t
 
-                    if qd.abs(g_best) > gtol:
-                        # Need bisection — use thread-0 sequential bisection with _ls_eval_cost_grad
-                        # (bisection is ~5 iterations, thread-0 cost is acceptable)
-                        bis_a = alpha_eval * 0.5
-                        bis_b = alpha_eval
-                        if g_best < 0.0:
-                            bis_a = alpha_eval
-                            bis_b = alpha_eval * 2.0
+                    bis_a = sh_cand_alpha[2]
+                    bis_b = sh_cand_alpha[3]
 
-                        _, g_a = _ls_eval_cost_grad(bis_a, i_b, constraint_state)
-                        _, g_b = _ls_eval_cost_grad(bis_b, i_b, constraint_state)
+                    if _bis_step == 0:
+                        # First step: check if gradient is already converged
+                        if qd.abs(g_eval) <= gtol:
+                            sh_cand_alpha[1] = gs.qd_float(0.0)  # signal: done
+                        else:
+                            # Set initial bracket based on gradient sign
+                            if g_eval > 0.0:
+                                bis_b = alpha_eval
+                            else:
+                                bis_a = alpha_eval
+                            # Compute midpoint for next iteration
+                            sh_cand_alpha[1] = (bis_a + bis_b) * 0.5
+                            sh_cand_alpha[2] = bis_a
+                            sh_cand_alpha[3] = bis_b
+                    else:
+                        # Bisection step: update bracket and compute next midpoint
+                        if qd.abs(g_eval) <= gtol or qd.abs(bis_b - bis_a) < rigid_global_info.EPS[None]:
+                            # Converged — accept if cost improved
+                            if c_eval < p0_cost and c_eval < constraint_state.candidates[4, i_b]:
+                                constraint_state.candidates[0, i_b] = alpha_eval
+                                constraint_state.candidates[4, i_b] = c_eval
+                            sh_cand_alpha[1] = gs.qd_float(0.0)  # signal: done
+                        else:
+                            if g_eval < 0.0:
+                                bis_a = alpha_eval
+                            else:
+                                bis_b = alpha_eval
+                            sh_cand_alpha[1] = (bis_a + bis_b) * 0.5
+                            sh_cand_alpha[2] = bis_a
+                            sh_cand_alpha[3] = bis_b
+                qd.simt.block.sync()
 
-                        if g_a < 0.0 and g_b > 0.0:
-                            _N_BISECT = qd.static(LS_BISECT_STEPS)
-                            for _bis_it in range(_N_BISECT):
-                                mid_b = (bis_a + bis_b) * 0.5
-                                c_mid_b, g_mid_b = _ls_eval_cost_grad(mid_b, i_b, constraint_state)
-                                if qd.abs(g_mid_b) < gtol or qd.abs(bis_b - bis_a) < rigid_global_info.EPS[None]:
-                                    break
-                                if g_mid_b < 0.0:
-                                    bis_a = mid_b
-                                else:
-                                    bis_b = mid_b
-                            mid_b = (bis_a + bis_b) * 0.5
-                            c_mid_b, _ = _ls_eval_cost_grad(mid_b, i_b, constraint_state)
-                            if c_mid_b < p0_cost and c_mid_b < constraint_state.candidates[4, i_b]:
-                                constraint_state.candidates[0, i_b] = mid_b
-                                constraint_state.candidates[4, i_b] = c_mid_b
+                # Check termination signal from thread 0
+                if sh_cand_alpha[1] <= 0.0:
+                    break
+
         else:
             if tid == 0:
                 constraint_state.candidates[0, i_b] = 0.0
