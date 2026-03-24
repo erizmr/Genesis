@@ -150,14 +150,18 @@ def _kernel_parallel_linesearch_jv(
 
 @qd.kernel(fastcache=gs.use_fastcache)
 def _kernel_parallel_linesearch_p0(
+    dofs_info: array_class.DofsInfo,
+    entities_info: array_class.EntitiesInfo,
     dofs_state: array_class.DofsState,
     constraint_state: array_class.ConstraintState,
     rigid_global_info: array_class.RigidGlobalInfo,
     static_rigid_sim_config: qd.template(),
 ):
-    """Snorm check, quad_gauss, eq_sum, and p0_cost. T threads per env with shared memory reductions.
+    """Fused mv + jv + snorm + quad_gauss + eq_sum + p0_cost. T threads per env with shared memory.
 
-    Phase 1: Fused snorm + quad_gauss parallel reduction over n_dofs (Options A+B).
+    Phase 0a: Compute mv = M @ search (cooperative over DOFs).
+    Phase 0b: Compute jv = J @ search (cooperative over constraints).
+    Phase 1: Fused snorm + quad_gauss parallel reduction over n_dofs.
     Phase 2: Parallel reduction over n_constraints for eq_sum and p0_cost.
     """
     _B = constraint_state.grad.shape[1]
@@ -178,6 +182,34 @@ def _kernel_parallel_linesearch_p0(
 
         if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
             n_dofs = constraint_state.search.shape[0]
+            n_con = constraint_state.n_constraints[i_b]
+
+            # === Phase 0a: Compute mv = M @ search (cooperative over DOFs) ===
+            i_d1 = tid
+            while i_d1 < n_dofs:
+                I_d1 = [i_d1, i_b] if qd.static(static_rigid_sim_config.batch_dofs_info) else i_d1
+                i_e = dofs_info.entity_idx[I_d1]
+                mv_val = gs.qd_float(0.0)
+                for i_d2 in range(entities_info.dof_start[i_e], entities_info.dof_end[i_e]):
+                    mv_val = mv_val + rigid_global_info.mass_mat[i_d1, i_d2, i_b] * constraint_state.search[i_d2, i_b]
+                constraint_state.mv[i_d1, i_b] = mv_val
+                i_d1 += _T
+
+            # === Phase 0b: Compute jv = J @ search (cooperative over constraints) ===
+            i_c = tid
+            while i_c < n_con:
+                jv_val = gs.qd_float(0.0)
+                if qd.static(static_rigid_sim_config.sparse_solve):
+                    for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
+                        i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+                        jv_val = jv_val + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+                else:
+                    for i_d in range(n_dofs):
+                        jv_val = jv_val + constraint_state.jac[i_c, i_d, i_b] * constraint_state.search[i_d, i_b]
+                constraint_state.jv[i_c, i_b] = jv_val
+                i_c += _T
+
+            qd.simt.block.sync()  # Ensure mv and jv are written before reading
 
             # === Phase 1: Fused snorm + quad_gauss, parallel over n_dofs ===
             local_snorm_sq = gs.qd_float(0.0)
@@ -540,34 +572,27 @@ def _kernel_parallel_linesearch_eval(
                 constraint_state.candidates[0, i_b] = 0.0
             qd.simt.block.sync()
 
-
-@qd.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_linesearch_apply_alpha(
-    constraint_state: array_class.ConstraintState,
-    rigid_global_info: array_class.RigidGlobalInfo,
-    static_rigid_sim_config: qd.template(),
-):
-    """Apply best alpha to qacc, Ma, and Jaref. Fuses dof and constraint updates."""
-    n_dofs = constraint_state.qacc.shape[0]
-    len_constraints = constraint_state.Jaref.shape[0]
-    _B = constraint_state.grad.shape[1]
-    n_items = qd.max(n_dofs, len_constraints)
-
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-    for i, i_b in qd.ndrange(n_items, _B):
-        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
-            alpha = constraint_state.candidates[0, i_b]
-            if qd.abs(alpha) < rigid_global_info.EPS[None]:
-                if i == 0:
+        # === Phase 4: Cooperative apply alpha (fused, saves 1 kernel launch) ===
+        qd.simt.block.sync()
+        if active:
+            n_dofs_apply = constraint_state.qacc.shape[0]
+            n_con_apply = constraint_state.n_constraints[i_b]
+            alpha_apply = constraint_state.candidates[0, i_b]
+            if qd.abs(alpha_apply) < rigid_global_info.EPS[None]:
+                if tid == 0:
                     constraint_state.improved[i_b] = False
             else:
-                # Apply to dofs
-                if i < n_dofs:
-                    constraint_state.qacc[i, i_b] += constraint_state.search[i, i_b] * alpha
-                    constraint_state.Ma[i, i_b] += constraint_state.mv[i, i_b] * alpha
-                # Apply to constraints
-                if i < constraint_state.n_constraints[i_b]:
-                    constraint_state.Jaref[i, i_b] += constraint_state.jv[i, i_b] * alpha
+                # Apply to dofs (strided over threads)
+                i_d = tid
+                while i_d < n_dofs_apply:
+                    constraint_state.qacc[i_d, i_b] += constraint_state.search[i_d, i_b] * alpha_apply
+                    constraint_state.Ma[i_d, i_b] += constraint_state.mv[i_d, i_b] * alpha_apply
+                    i_d += _K
+                # Apply to constraints (strided over threads)
+                i_c = tid
+                while i_c < n_con_apply:
+                    constraint_state.Jaref[i_c, i_b] += constraint_state.jv[i_c, i_b] * alpha_apply
+                    i_c += _K
 
 
 # ============================================== Shared iteration kernels ==============================================
@@ -819,30 +844,17 @@ def func_solve_decomposed(
     """
     # _n_iterations is a Python-native int to avoid CPU-GPU sync (vs rigid_global_info.iterations[None])
     for _it in range(_n_iterations):
-        _kernel_parallel_linesearch_mv(
+        # Fused mv + jv + p0 (saves 2 kernel launches vs separate kernels)
+        _kernel_parallel_linesearch_p0(
             dofs_info,
             entities_info,
-            constraint_state,
-            rigid_global_info,
-            static_rigid_sim_config,
-        )
-        _kernel_parallel_linesearch_jv(
-            constraint_state,
-            static_rigid_sim_config,
-        )
-        _kernel_parallel_linesearch_p0(
             dofs_state,
             constraint_state,
             rigid_global_info,
             static_rigid_sim_config,
         )
-        # Grid search + gradient-guided Newton correction (single pass)
+        # Fused grid search + bisection + apply alpha (saves 1 kernel launch)
         _kernel_parallel_linesearch_eval(
-            constraint_state,
-            rigid_global_info,
-            static_rigid_sim_config,
-        )
-        _kernel_parallel_linesearch_apply_alpha(
             constraint_state,
             rigid_global_info,
             static_rigid_sim_config,
