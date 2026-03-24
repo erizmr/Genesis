@@ -42,3 +42,46 @@ After grid search, thread 0 runs gradient-guided refinement:
 ### Change 1: Baseline (current state)
 - Grid search only, no gradient refinement
 - 262 passed, 7 skipped, 1 xfailed (test_mesh_primitive_COM fails on main too)
+
+### Change 2: Analytical gradient bisection (commit eaebff93)
+- Added `_ls_eval_cost_grad` — analytical cost+gradient at any alpha (follows `func_ls_point_fn_opt` pattern)
+- Branch B: after grid accepts best_alpha, compute grad; if |grad| > gtol, bisect within grid neighbors
+- Branch A: when grid finds no improvement, check grad(0); if cost decreasing, bisect [0, lo]
+- All paths guarded by `cost < p0_cost` check
+- Quadrants compiler constraints: no `for...else`, variables must be defined before `if/else` branches
+
+**Correctness**: 262 passed, 7 skipped, 1 xfailed (same as baseline)
+
+**Performance** (benchmark ref: `260323_bisect_v1`):
+
+| Case | Main FPS | Branch FPS | Delta |
+|------|----------|------------|-------|
+| box_pyramid_6 | 19,111 | 20,959 | **+9.7%** |
+| box_pyramid_6 (gjk) | 20,585 | 22,589 | **+9.7%** |
+| g1_fall | 438,431 | 264,608 | **-39.6%** |
+| dex_hand | 5,767 | 5,426 | -5.9% |
+
+**Finding**: g1_fall regression is **pre-existing** (same -39.8% in previous baseline run before bisection). Root cause: the decomposed path with parallel LS (K=32 grid) is slower than the sequential iterative LS for g1_fall due to higher per-thread work (each of 32 threads loops over all constraints). The `perf_dispatch` selects the decomposed path during warmup when constraints are few (humanoid not yet fallen), then sticks with it for the actual benchmark.
+
+### Change 3: Dual decomposed paths for perf_dispatch (commit b1c74c1c)
+- Added `_kernel_linesearch` — sequential iterative LS kernel (same as main branch)
+- Added `func_solve_decomposed_sequential` — decomposed solver using sequential LS
+- Now perf_dispatch has 3 options: monolith, decomposed+sequential, decomposed+parallel
+- perf_dispatch benchmarks all 3 during warmup (6 calls each) and picks the fastest
+
+**Correctness**: 262 passed, 7 skipped, 1 xfailed (same as baseline)
+
+**Performance** (benchmark ref: `260323_bisect_v2_seqls`):
+
+| Case | Main FPS | Branch FPS | Delta |
+|------|----------|------------|-------|
+| g1_fall | 442,305 | 462,463 | **+4.6%** |
+| box_pyramid_6 | 19,172 | 21,133 | **+10.2%** |
+| box_pyramid_6 (gjk) | 20,431 | 22,739 | **+11.3%** |
+| dex_hand | 5,676 | 5,462 | -3.8% |
+| go2 (Newton) | 2,202,572 | 2,335,512 | +6.0% |
+| franka_random (gjk) | 8,088,104 | 8,633,415 | +6.7% |
+
+**g1_fall regression fixed!** With the sequential LS variant available, perf_dispatch now correctly selects the sequential LS for g1_fall (many constraints/env) and parallel LS for box_pyramid_6 (few constraints/env). Both key cases now show improvements over main.
+
+Only `dex_hand` shows a small regression (-3.8%), likely because the perf_dispatch warmup picks a suboptimal variant for this specific scene.
