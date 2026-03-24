@@ -140,3 +140,113 @@ Kernel 2 (_kernel_parallel_linesearch_eval):
    Net result: same or better alpha quality with much less total work.
 
 **Correctness**: 262 passed, 7 skipped, 1 xfailed
+
+---
+
+## Current Implementation Overview
+
+### File: `genesis/engine/solvers/rigid/constraint/solver_breakdown.py`
+
+The parallel linesearch replaces the sequential Newton-guided linesearch from `solver.py` with a
+GPU-friendly approach that uses cooperative thread parallelism. The full solver iteration pipeline is:
+
+```
+func_solve_decomposed (per solver iteration):
+  ┌─ Kernel 1: _kernel_parallel_linesearch_p0 (32 threads/env)
+  │   Phase 0a: mv = M @ search          — cooperative over DOFs, strided by 32
+  │   Phase 0b: jv = J @ search          — cooperative over constraints, strided by 32
+  │   Phase 1:  snorm + quad_gauss       — shared-mem reduction over DOFs
+  │   Phase 2:  eq_sum + p0_cost + gtol  — shared-mem reduction over constraints
+  │             + Newton step estimate → search range [lo, hi]
+  │
+  ├─ Kernel 2: _kernel_parallel_linesearch_eval (32 threads/env)
+  │   Phase 1:  Cooperative grid search   — 8+1 candidates, 32 threads reduce
+  │             constraints cooperatively for each candidate (N/32 per thread)
+  │   Phase 2:  Argmin across candidates  — thread-0 sequential scan
+  │   Phase 3:  Cooperative gradient      — 32 threads reduce quad coefficients
+  │             + thread-0 bisection      — up to 12 iterations, cost-guarded
+  │   Phase 4:  Cooperative apply alpha   — 32 threads update qacc/Ma/Jaref
+  │
+  ├─ _kernel_update_constraint_forces     — (constraint × env) threads
+  ├─ _kernel_update_constraint_qfrc       — (dof × env) threads
+  ├─ _kernel_update_constraint_cost       — 1 thread/env
+  ├─ _kernel_newton_only_nt_hessian       — Newton: hessian + Cholesky
+  ├─ _kernel_update_gradient              — 1 thread/env
+  └─ _kernel_update_search_direction      — 1 thread/env
+```
+
+### Key components:
+
+**`_ls_eval_cost_grad(alpha, i_b, constraint_state)`** — `@qd.func` for thread-0 use.
+Computes analytical cost and gradient at any alpha by accumulating piecewise-quadratic
+coefficients from `quad_gauss` + `eq_sum` (precomputed by p0) plus activation-dependent
+friction/contact terms. Matches `func_ls_point_fn_opt` in solver.py. Used by bisection.
+
+**`_kernel_parallel_linesearch_p0`** — Fused initialization kernel.
+Computes mv (mass-matrix × search) and jv (Jacobian × search) cooperatively, then
+runs shared-memory reductions for snorm, quad_gauss (DOF quadratic coefficients),
+eq_sum (equality constraint coefficients), and p0_cost. Thread 0 derives the Newton
+step estimate and sets the search range `[alpha_newton * 0.01, alpha_newton * 10]`.
+
+**`_kernel_parallel_linesearch_eval`** — Fused eval + bisect + apply kernel.
+- **Grid search**: Evaluates `LS_N_CANDIDATES=8` log-spaced alphas + the Newton alpha.
+  For each candidate, all 32 threads cooperatively reduce constraint costs via strided
+  loops + shared-memory tree reduction. Total per-thread work: `9 × (n_con/32)`.
+- **Gradient bisection**: After selecting the best candidate, 32 threads cooperatively
+  compute the analytical gradient. If `|grad| > gtol`, thread 0 runs bisection (up to
+  `LS_BISECT_STEPS=12` iterations) using `_ls_eval_cost_grad`. All results are
+  cost-guarded (`cost < p0_cost`) before acceptance.
+- **Apply alpha**: All 32 threads cooperatively update `qacc`, `Ma`, `Jaref` with the
+  accepted step size, eliminating a separate kernel launch.
+
+**`func_solve_decomposed_sequential`** — Disabled in this branch. When enabled, provides
+the sequential iterative LS (same as main) as an alternative for perf_dispatch to choose.
+
+### Constants:
+- `LS_PARALLEL_K = 32` — threads per env (block dimension)
+- `LS_N_CANDIDATES = 8` — grid search candidates (evaluated cooperatively)
+- `LS_BISECT_STEPS = 12` — max bisection iterations
+- `LS_ALPHA_MAX = 1e4` — hard upper bound on step size
+- `LS_PARALLEL_MIN_STEP = 1e-6` — floor for Newton step estimate
+
+---
+
+## Benchmark Results Summary
+
+### Parallel-only (`--solver decomposed`, `func_solve_decomposed_sequential` disabled)
+
+On branch `mingrui/parallel-ls-grad-check-v2` (commit 33155788):
+
+| Case | Main FPS | Branch FPS | Delta |
+|------|----------|------------|-------|
+| **g1_fall** | 460,065 | 500,107 | **+8.7%** |
+| **dex_hand** | 5,514 | 6,390 | **+15.9%** |
+| box_pyramid_6 | 21,032 | 19,370 | -7.9% |
+| box_pyramid_6 (gjk) | 23,801 | 21,223 | -10.8% |
+
+### With perf_dispatch auto-selection (`--solver auto` and `--solver decomposed`)
+
+On branch `mingrui/parallel-ls-grad-check-v2-auto` (commit 5fc8de88, `func_solve_decomposed_sequential` re-enabled):
+
+**`--solver decomposed`** (perf_dispatch picks between parallel LS and sequential LS):
+
+| Case | Main FPS | Branch FPS | Delta |
+|------|----------|------------|-------|
+| **g1_fall** | 460,065 | 511,033 | **+11.1%** |
+| **dex_hand** | 5,514 | 6,353 | **+15.2%** |
+| box_pyramid_6 | 21,032 | 19,529 | -7.2% |
+| box_pyramid_6 (gjk) | 23,801 | 21,670 | -9.0% |
+
+**`--solver auto`** (perf_dispatch picks between monolith, decomposed+sequential, decomposed+parallel):
+
+| Case | Main FPS | Branch FPS | Delta |
+|------|----------|------------|-------|
+| **g1_fall** | 460,065 | 507,010 | **+10.2%** |
+| box_pyramid_6 | 21,032 | 21,174 | +0.7% |
+| box_pyramid_6 (gjk) | 23,801 | 22,567 | -5.2% |
+| dex_hand | 5,514 | 5,417 | -1.8% |
+
+### Key takeaways:
+- The parallel LS with cooperative reduction + full kernel fusion delivers **+8-16% on contact-rich scenes** (g1_fall, dex_hand)
+- box_pyramid_6 regresses when forced through parallel LS (-8%), but with `--solver auto` perf_dispatch selects the monolith and box_pyramid_6 stays near parity (+0.7%)
+- The cooperative reduction was the biggest single optimization: box_pyramid_6 went from -31% to -8%, g1_fall from +1.4% to +8.7%
