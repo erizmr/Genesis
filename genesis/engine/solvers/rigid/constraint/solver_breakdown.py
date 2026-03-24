@@ -745,6 +745,39 @@ def _kernel_update_search_direction(
             )
 
 
+# ============================================ Sequential linesearch ================================================
+
+
+@qd.kernel(fastcache=gs.use_fastcache)
+def _kernel_linesearch(
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+):
+    """Sequential iterative linesearch (same as main branch).
+
+    Each thread handles one env, using Newton-guided derivative linesearch.
+    Lower per-env parallelism but less total work than the K=32 grid search.
+    Better for scenes with many constraints per env (e.g. humanoid contact).
+    """
+    _B = constraint_state.grad.shape[1]
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0 and constraint_state.improved[i_b]:
+            solver.func_linesearch_and_apply_alpha(
+                i_b,
+                entities_info=entities_info,
+                dofs_state=dofs_state,
+                rigid_global_info=rigid_global_info,
+                constraint_state=constraint_state,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+        else:
+            constraint_state.improved[i_b] = False
+
+
 # ============================================== Solve body dispatch ================================================
 
 
@@ -819,6 +852,73 @@ def func_solve_decomposed(
             static_rigid_sim_config,
         )
 
+        if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
+            _kernel_newton_only_nt_hessian(
+                constraint_state,
+                rigid_global_info,
+                static_rigid_sim_config,
+            )
+        _kernel_update_gradient(
+            entities_info,
+            dofs_state,
+            constraint_state,
+            rigid_global_info,
+            static_rigid_sim_config,
+        )
+        _kernel_update_search_direction(
+            constraint_state,
+            rigid_global_info,
+            static_rigid_sim_config,
+        )
+
+
+@solver.func_solve_body.register(
+    is_compatible=lambda *args, **kwargs: (
+        gs.backend in {gs.cuda} and not (args[5] if len(args) > 5 else kwargs["static_rigid_sim_config"]).requires_grad
+    )
+)
+def func_solve_decomposed_sequential(
+    entities_info,
+    dofs_info,
+    dofs_state,
+    constraint_state,
+    rigid_global_info,
+    static_rigid_sim_config,
+    _n_iterations,
+):
+    """Decomposed solver with sequential iterative linesearch.
+
+    Same kernel-per-step structure as func_solve_decomposed but uses the sequential
+    Newton-guided linesearch (1 thread per env) instead of the parallel grid search
+    (K threads per env). Better for scenes with many constraints per env where the
+    grid search does more total work than needed.
+    """
+    for _it in range(_n_iterations):
+        _kernel_linesearch(
+            entities_info,
+            dofs_state,
+            constraint_state,
+            rigid_global_info,
+            static_rigid_sim_config,
+        )
+        if static_rigid_sim_config.solver_type == gs.constraint_solver.CG:
+            _kernel_cg_only_save_prev_grad(
+                constraint_state,
+                static_rigid_sim_config,
+            )
+        _kernel_update_constraint_forces(
+            constraint_state,
+            static_rigid_sim_config,
+        )
+        _kernel_update_constraint_qfrc(
+            constraint_state,
+            static_rigid_sim_config,
+        )
+        _kernel_update_constraint_cost(
+            dofs_state,
+            constraint_state,
+            static_rigid_sim_config,
+        )
         if static_rigid_sim_config.solver_type == gs.constraint_solver.Newton:
             _kernel_newton_only_nt_hessian(
                 constraint_state,
