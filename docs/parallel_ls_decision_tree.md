@@ -177,3 +177,22 @@ Repeat until stopping condition:
 > **Baseline**: original fixed three-pass cost = `K × 3 = 96` evals (K = 32).
 > The hybrid strategy matches or improves upon this in most paths while correctly
 > handling cases where the original parallel linesearch returns a suboptimal result.
+
+
+Note:
+
+Commit and push after each important change to prevent code lost
+
+## Test correctness
+
+After each important features you added, run `pytest -xsv --backend gpu "tests/test_rigid_physics.py"` to ensure every test case are passed.
+
+
+## Test perf
+
+You can use the following command to test the performance, in which <version_name> and <branch_name> is something you need to fill according to current implementing feature 
+`python /home/mingrui/workspace/perso_hugh/ai/scripts/bench_cluster_wandb.py --ref 260323_<version_name> --branch <branch_name> --solver auto`
+
+Note you need to push your lastest commit so that it can be effective in this perf test.
+
+The command will trigger a cluster run, and the results are stored in `/home/mingrui/workspace/tmp/260323_<version_name>/results.csv`, which show the perf comaprison of curent branch to main. In the results.csv, pay attention to `g1_fall` and `box_pyramid_6`, i.e., branch should expect better performance on these two cases comparing to main.
