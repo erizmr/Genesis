@@ -85,3 +85,21 @@ After grid search, thread 0 runs gradient-guided refinement:
 **g1_fall regression fixed!** With the sequential LS variant available, perf_dispatch now correctly selects the sequential LS for g1_fall (many constraints/env) and parallel LS for box_pyramid_6 (few constraints/env). Both key cases now show improvements over main.
 
 Only `dex_hand` shows a small regression (-3.8%), likely because the perf_dispatch warmup picks a suboptimal variant for this specific scene.
+
+### Change 4-5: Cooperative reduction + kernel fusion (parallel-only benchmarks)
+
+Disabled `func_solve_decomposed_sequential` to benchmark parallel LS in isolation (`--solver decomposed`).
+
+**Key optimization**: Rewrote eval kernel from independent per-thread evaluation to cooperative constraint reduction. All K=32 threads share constraint work per alpha candidate, reducing per-thread work from O(n_constraints) to O(n_constraints/K).
+
+| Version | g1_fall | box_pyramid_6 | dex_hand | Notes |
+|---------|---------|---------------|----------|-------|
+| Baseline (K=32 independent) | +1.4% | -31.3% | -1.4% | Original parallel LS |
+| Cooperative reduction | +2.4% | **-1.7%** | +3.0% | 17x less constraint work |
+| + Full kernel fusion (2 kernels) | **+8.7%** | -7.9% | **+15.9%** | mv/jv fusion hurts parallelism |
+| + Partial fusion (4 kernels) | **+7.8%** | **-2.3%** | **+8.7%** | Best balance |
+
+**Current state** (commit 321717f9): separate mv+jv + cooperative eval + fused apply.
+- g1_fall: **+7.8%** (meets +5% target)
+- dex_hand: **+8.7%** (meets +5% target)
+- box_pyramid_6: -2.3% (near parity, needs work)
