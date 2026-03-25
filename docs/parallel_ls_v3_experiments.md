@@ -77,3 +77,39 @@ refinement, so fewer candidates should suffice for an initial bracket.
 **Verdict: KEEP N=6.** Best g1_fall (+10.0%), good dex_hand (+13.4%), better box_pyramid_6
 than N=8. The trade-off is 2 fewer cooperative reductions per solver iteration (7 vs 9 total
 candidates including Newton), saving ~2 × n_constraints/32 work per thread.
+
+---
+
+## Experiment 3: repeat_after_count for --solver auto (commit 66403087)
+
+**Problem**: With `repeat_after_seconds=0` (disabled on main via PR #2599), perf_dispatch
+locks its decision at warmup. For g1_fall, warmup has few contacts → monolith wins →
+locked forever → -42% regression in steady state.
+
+**Root cause investigation**: Compared before/after rebase benchmarks:
+- Before rebase (`260324_new_par_auto`): g1_fall **+10.3%**, box_pyramid_6 -0.4%
+- After rebase (`260324_new_par_auto_double_check`): g1_fall **-42.2%**, box_pyramid_6 +6.0%
+
+The rebase brought PR #2599 which changed `repeat_after_seconds` from 1.0 to 0.0. Before
+the rebase, periodic re-benchmarking allowed perf_dispatch to detect that decomposed+parallel
+became faster after the humanoid fell. After the rebase, the warmup decision is permanent.
+
+**Solution**: Use `repeat_after_count=3000` — re-benchmark after 3000 calls (~300 steps).
+By step 300, g1_fall's humanoid has landed and has many contacts. The re-benchmark switches
+to decomposed+parallel. For fast scenes, the sync overhead is ~120μs every 3000 calls
+(0.04% for g1_fall, ~1.7% for fast 30k scenes).
+
+**Correctness**: 262 passed, 7 skipped, 1 xfailed
+
+**Performance** (`260323_rebench3000_auto`, --solver auto):
+
+| Case | Main FPS | Branch FPS | Delta |
+|------|----------|------------|-------|
+| **g1_fall** | 460,065 | 505,651 | **+9.9%** |
+| box_pyramid_6 | 21,032 | 20,985 | -0.2% |
+| dex_hand | 5,514 | 5,502 | -0.2% |
+| anymal_zero 30k | 13,730,507 | 13,498,325 | -1.7% |
+| franka 30k | 15,183,542 | 14,915,836 | -1.8% |
+
+**Verdict: KEEP.** g1_fall +9.9% with `--solver auto`. box_pyramid_6 at parity.
+Fast scenes show ~1.7% regression from periodic re-benchmark sync — acceptable tradeoff.
