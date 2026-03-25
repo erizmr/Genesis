@@ -113,3 +113,33 @@ to decomposed+parallel. For fast scenes, the sync overhead is ~120μs every 3000
 
 **Verdict: KEEP.** g1_fall +9.9% with `--solver auto`. box_pyramid_6 at parity.
 Fast scenes show ~1.7% regression from periodic re-benchmark sync — acceptable tradeoff.
+
+---
+
+## Experiment 4: Branch A2 + B2 expansion (commit 5879fb78) — REVERTED
+
+Implemented the missing decision tree branches identified in `docs/comments_from_claude.md`:
+- Branch A2: grad(0) < -gtol → exponential expansion (lo, 4×lo, 16×lo, 64×lo) + bisect
+- Branch B2: grad(best) < -gtol → expansion from best_alpha (4x, 16x, 64x) + bisect
+- Branch B3: grad(best) > gtol → bisect [best/2, best]
+
+All expansion/bisection runs on thread-0 using `_ls_eval_cost_grad`.
+
+**Correctness**: 262 passed
+
+**Performance** (`260323_expansion_decomposed`, --solver decomposed):
+
+| Case | Before | After | Change |
+|------|--------|-------|--------|
+| g1_fall | +10.0% | +8.6% | -1.4pp |
+| box_pyramid_6 | -5.8% | **-19.5%** | -13.7pp |
+| dex_hand | +13.4% | +13.7% | +0.3pp |
+
+**Verdict: REVERTED.** The expansion runs on thread 0 only (31 threads idle), making
+each expansion step O(n_constraints) with no parallelism. For box_pyramid_6 (many
+constraints), this adds massive overhead. The expansion fires more often than expected
+and the alpha quality improvement doesn't translate to fewer outer solver iterations.
+
+The review's suggestion is theoretically sound but the thread-0-only implementation
+is too expensive. Would need cooperative expansion (all 32 threads) to be viable, but
+that adds significant kernel complexity for marginal quality gains.
