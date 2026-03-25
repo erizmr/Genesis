@@ -143,3 +143,34 @@ and the alpha quality improvement doesn't translate to fewer outer solver iterat
 The review's suggestion is theoretically sound but the thread-0-only implementation
 is too expensive. Would need cooperative expansion (all 32 threads) to be viable, but
 that adds significant kernel complexity for marginal quality gains.
+
+---
+
+## Experiment 5: Conditional expansion kernel (commit f7fbd306) — REVERTED
+
+Attempted a middle ground: expansion in a SEPARATE kernel that checks a per-env flag.
+The eval kernel sets `candidates[6]` when expansion is needed (Branch A2 or B2). The
+expansion kernel reads the flag, skips instantly for flag=0 envs, and only runs
+expansion+bisection+delta-apply for flagged envs.
+
+**Correctness**: 262 passed
+
+**Performance** (`260323_cond_expand`, --solver decomposed):
+
+| Case | No expansion | Cond. expansion | Change |
+|------|-------------|-----------------|--------|
+| g1_fall | +10.0% | +4.9% | -5.1pp |
+| box_pyramid_6 | -5.8% | -20.8% | -15.0pp |
+| dex_hand | +13.4% | +8.5% | -4.9pp |
+
+**Verdict: REVERTED.** Even with conditional execution, the extra kernel launch (~2μs ×
+10 iterations = ~20μs per step) plus the expansion work for flagged envs hurts ALL cases.
+The flag fires more often than expected for box_pyramid_6.
+
+**Final conclusion on expansion**: The uncovered branches (A2, B2) are real but the
+performance cost of covering them exceeds the benefit in ALL tested implementations:
+1. In-kernel thread-0 expansion: -19.5% box_pyramid (Experiment 4)
+2. Separate conditional kernel: -20.8% box_pyramid (Experiment 5)
+The alpha quality improvement from expansion doesn't reduce outer solver iteration
+count enough to offset the per-iteration overhead. The current grid search + bisection
+is the right trade-off.
