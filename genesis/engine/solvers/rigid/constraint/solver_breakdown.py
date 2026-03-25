@@ -488,105 +488,70 @@ def _kernel_parallel_linesearch_eval(
                 sh_cand_alpha[0] = best_alpha
             qd.simt.block.sync()
 
-            # === Phase 3: Cooperative gradient check + bisection + expansion ===
+            # === Phase 3: Cooperative gradient bisection ===
             best_alpha_shared = sh_cand_alpha[0]
+            if best_alpha_shared > 0.0:
+                # Cooperatively compute gradient at best_alpha
+                alpha_eval = best_alpha_shared
 
-            # Phase 3a: Cooperatively compute gradient at best_alpha (or alpha=0 for Branch A)
-            # Thread 0 writes the alpha to evaluate; 0.0 means no improvement from grid (Branch A).
-            alpha_eval = best_alpha_shared
-            if best_alpha_shared <= 0.0:
-                alpha_eval = gs.qd_float(0.0)  # Branch A: evaluate grad(0)
+                # Cooperative gradient: accumulate quad_total_1 and quad_total_2
+                local_qt1 = gs.qd_float(0.0)
+                local_qt2 = gs.qd_float(0.0)
+                i_c = ne + tid
+                while i_c < n_con:
+                    Jaref_c = constraint_state.Jaref[i_c, i_b]
+                    jv_c = constraint_state.jv[i_c, i_b]
+                    D = constraint_state.efc_D[i_c, i_b]
+                    x = Jaref_c + alpha_eval * jv_c
+                    if i_c < nef:
+                        f_val = constraint_state.efc_frictionloss[i_c, i_b]
+                        r_val = constraint_state.diag[i_c, i_b]
+                        rf = r_val * f_val
+                        linear_neg = x <= -rf
+                        linear_pos = x >= rf
+                        qf_1 = D * (jv_c * Jaref_c)
+                        qf_2 = D * (0.5 * jv_c * jv_c)
+                        if linear_neg or linear_pos:
+                            qf_1 = linear_neg * (-f_val * jv_c) + linear_pos * (f_val * jv_c)
+                            qf_2 = 0.0
+                        local_qt1 = local_qt1 + qf_1
+                        local_qt2 = local_qt2 + qf_2
+                    else:
+                        act = x < 0
+                        local_qt1 = local_qt1 + D * (jv_c * Jaref_c) * act
+                        local_qt2 = local_qt2 + D * (0.5 * jv_c * jv_c) * act
+                    i_c += _K
 
-            local_qt1 = gs.qd_float(0.0)
-            local_qt2 = gs.qd_float(0.0)
-            i_c = ne + tid
-            while i_c < n_con:
-                Jaref_c = constraint_state.Jaref[i_c, i_b]
-                jv_c = constraint_state.jv[i_c, i_b]
-                D = constraint_state.efc_D[i_c, i_b]
-                x = Jaref_c + alpha_eval * jv_c
-                if i_c < nef:
-                    f_val = constraint_state.efc_frictionloss[i_c, i_b]
-                    r_val = constraint_state.diag[i_c, i_b]
-                    rf = r_val * f_val
-                    linear_neg = x <= -rf
-                    linear_pos = x >= rf
-                    qf_1 = D * (jv_c * Jaref_c)
-                    qf_2 = D * (0.5 * jv_c * jv_c)
-                    if linear_neg or linear_pos:
-                        qf_1 = linear_neg * (-f_val * jv_c) + linear_pos * (f_val * jv_c)
-                        qf_2 = 0.0
-                    local_qt1 = local_qt1 + qf_1
-                    local_qt2 = local_qt2 + qf_2
-                else:
-                    act = x < 0
-                    local_qt1 = local_qt1 + D * (jv_c * Jaref_c) * act
-                    local_qt2 = local_qt2 + D * (0.5 * jv_c * jv_c) * act
-                i_c += _K
-
-            sh_val[tid] = local_qt1
-            sh_val2[tid] = local_qt2
-            qd.simt.block.sync()
-            stride = _K // 2
-            while stride > 0:
-                if tid < stride:
-                    sh_val[tid] += sh_val[tid + stride]
-                    sh_val2[tid] += sh_val2[tid + stride]
+                # Reduce qt1 and qt2
+                sh_val[tid] = local_qt1
+                sh_val2[tid] = local_qt2
                 qd.simt.block.sync()
-                stride //= 2
+                stride = _K // 2
+                while stride > 0:
+                    if tid < stride:
+                        sh_val[tid] += sh_val[tid + stride]
+                        sh_val2[tid] += sh_val2[tid + stride]
+                    qd.simt.block.sync()
+                    stride //= 2
 
-            # Phase 3b: Thread 0 decides action based on gradient
-            if tid == 0:
-                qt1_total = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b] + sh_val[0]
-                qt2_total = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b] + sh_val2[0]
-                g_eval = 2.0 * alpha_eval * qt2_total + qt1_total
+                if tid == 0:
+                    qt1_total = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b] + sh_val[0]
+                    qt2_total = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b] + sh_val2[0]
+                    g_best = 2.0 * alpha_eval * qt2_total + qt1_total
 
-                if best_alpha_shared <= 0.0:
-                    # --- Branch A: grid found no improvement ---
-                    if g_eval < -gtol:
-                        # Cost descending at alpha=0 — try expansion via thread-0 sequential eval
-                        # Exponential stepping: lo, 4*lo, 16*lo, 64*lo
-                        _AMAX = gs.qd_float(qd.static(LS_ALPHA_MAX))
-                        exp_a = gs.qd_float(0.0)  # last point with grad < 0
-                        exp_alpha = lo
-                        for _exp_step in range(4):
-                            c_exp, g_exp = _ls_eval_cost_grad(exp_alpha, i_b, constraint_state)
-                            if g_exp > 0.0:
-                                # Found bracket [exp_a, exp_alpha] — bisect
-                                bis_a = exp_a
-                                bis_b = exp_alpha
-                                _N_BISECT = qd.static(LS_BISECT_STEPS)
-                                for _bis_it in range(_N_BISECT):
-                                    mid_b = (bis_a + bis_b) * 0.5
-                                    c_mid_b, g_mid_b = _ls_eval_cost_grad(mid_b, i_b, constraint_state)
-                                    if qd.abs(g_mid_b) < gtol or qd.abs(bis_b - bis_a) < rigid_global_info.EPS[None]:
-                                        break
-                                    if g_mid_b < 0.0:
-                                        bis_a = mid_b
-                                    else:
-                                        bis_b = mid_b
-                                mid_b = (bis_a + bis_b) * 0.5
-                                c_mid_b, _ = _ls_eval_cost_grad(mid_b, i_b, constraint_state)
-                                if c_mid_b < p0_cost:
-                                    constraint_state.candidates[0, i_b] = mid_b
-                                    constraint_state.candidates[4, i_b] = c_mid_b
-                                break
-                            elif c_exp < p0_cost:
-                                # Cost improved but still descending — update best and continue
-                                constraint_state.candidates[0, i_b] = exp_alpha
-                                constraint_state.candidates[4, i_b] = c_exp
-                            exp_a = exp_alpha
-                            exp_alpha = qd.min(exp_alpha * 4.0, _AMAX)
-                            if exp_alpha >= _AMAX:
-                                break
-                elif qd.abs(g_eval) > gtol:
-                    # --- Branch B: grid found improvement, gradient not converged ---
-                    if g_eval > 0.0:
-                        # Branch B3: overshot — bisect [best/2, best]
+                    if qd.abs(g_best) > gtol:
+                        # Need bisection — use thread-0 sequential bisection with _ls_eval_cost_grad
+                        # (bisection is ~5 iterations, thread-0 cost is acceptable)
                         bis_a = alpha_eval * 0.5
                         bis_b = alpha_eval
+                        if g_best < 0.0:
+                            bis_a = alpha_eval
+                            bis_b = alpha_eval * 2.0
+
                         _, g_a = _ls_eval_cost_grad(bis_a, i_b, constraint_state)
-                        if g_a < 0.0:
+                        _, g_b = _ls_eval_cost_grad(bis_b, i_b, constraint_state)
+
+                        if g_a < 0.0 and g_b > 0.0:
                             _N_BISECT = qd.static(LS_BISECT_STEPS)
                             for _bis_it in range(_N_BISECT):
                                 mid_b = (bis_a + bis_b) * 0.5
@@ -602,40 +567,6 @@ def _kernel_parallel_linesearch_eval(
                             if c_mid_b < p0_cost and c_mid_b < constraint_state.candidates[4, i_b]:
                                 constraint_state.candidates[0, i_b] = mid_b
                                 constraint_state.candidates[4, i_b] = c_mid_b
-                    else:
-                        # Branch B2: still descending — exponential expansion from best_alpha
-                        _AMAX = gs.qd_float(qd.static(LS_ALPHA_MAX))
-                        exp_a = alpha_eval
-                        exp_alpha = alpha_eval * 4.0
-                        for _exp_step in range(4):
-                            if exp_alpha >= _AMAX:
-                                break
-                            c_exp, g_exp = _ls_eval_cost_grad(exp_alpha, i_b, constraint_state)
-                            if g_exp > 0.0:
-                                # Found bracket [exp_a, exp_alpha] — bisect
-                                bis_a = exp_a
-                                bis_b = exp_alpha
-                                _N_BISECT = qd.static(LS_BISECT_STEPS)
-                                for _bis_it in range(_N_BISECT):
-                                    mid_b = (bis_a + bis_b) * 0.5
-                                    c_mid_b, g_mid_b = _ls_eval_cost_grad(mid_b, i_b, constraint_state)
-                                    if qd.abs(g_mid_b) < gtol or qd.abs(bis_b - bis_a) < rigid_global_info.EPS[None]:
-                                        break
-                                    if g_mid_b < 0.0:
-                                        bis_a = mid_b
-                                    else:
-                                        bis_b = mid_b
-                                mid_b = (bis_a + bis_b) * 0.5
-                                c_mid_b, _ = _ls_eval_cost_grad(mid_b, i_b, constraint_state)
-                                if c_mid_b < p0_cost and c_mid_b < constraint_state.candidates[4, i_b]:
-                                    constraint_state.candidates[0, i_b] = mid_b
-                                    constraint_state.candidates[4, i_b] = c_mid_b
-                                break
-                            elif c_exp < p0_cost and c_exp < constraint_state.candidates[4, i_b]:
-                                constraint_state.candidates[0, i_b] = exp_alpha
-                                constraint_state.candidates[4, i_b] = c_exp
-                            exp_a = exp_alpha
-                            exp_alpha = qd.min(exp_alpha * 4.0, _AMAX)
         else:
             if tid == 0:
                 constraint_state.candidates[0, i_b] = 0.0
