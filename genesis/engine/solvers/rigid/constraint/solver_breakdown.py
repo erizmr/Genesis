@@ -488,18 +488,13 @@ def _kernel_parallel_linesearch_eval(
                 sh_cand_alpha[0] = best_alpha
             qd.simt.block.sync()
 
-            # === Phase 3: Cooperative gradient check + bisection ===
-            # candidates[6] = expansion flag: 0=done, 1=Branch A2 (grad(0)<-gtol),
-            #                                 2=Branch B2 (still descending)
+            # === Phase 3: Cooperative gradient bisection ===
             best_alpha_shared = sh_cand_alpha[0]
-            if tid == 0:
-                constraint_state.candidates[6, i_b] = 0.0  # default: no expansion needed
-            qd.simt.block.sync()
-
             if best_alpha_shared > 0.0:
                 # Cooperatively compute gradient at best_alpha
                 alpha_eval = best_alpha_shared
 
+                # Cooperative gradient: accumulate quad_total_1 and quad_total_2
                 local_qt1 = gs.qd_float(0.0)
                 local_qt2 = gs.qd_float(0.0)
                 i_c = ne + tid
@@ -527,6 +522,7 @@ def _kernel_parallel_linesearch_eval(
                         local_qt2 = local_qt2 + D * (0.5 * jv_c * jv_c) * act
                     i_c += _K
 
+                # Reduce qt1 and qt2
                 sh_val[tid] = local_qt1
                 sh_val2[tid] = local_qt2
                 qd.simt.block.sync()
@@ -544,6 +540,8 @@ def _kernel_parallel_linesearch_eval(
                     g_best = 2.0 * alpha_eval * qt2_total + qt1_total
 
                     if qd.abs(g_best) > gtol:
+                        # Need bisection — use thread-0 sequential bisection with _ls_eval_cost_grad
+                        # (bisection is ~5 iterations, thread-0 cost is acceptable)
                         bis_a = alpha_eval * 0.5
                         bis_b = alpha_eval
                         if g_best < 0.0:
@@ -569,55 +567,6 @@ def _kernel_parallel_linesearch_eval(
                             if c_mid_b < p0_cost and c_mid_b < constraint_state.candidates[4, i_b]:
                                 constraint_state.candidates[0, i_b] = mid_b
                                 constraint_state.candidates[4, i_b] = c_mid_b
-                        elif g_best < 0.0:
-                            # Branch B2: bracket failed, still descending → flag for expansion
-                            constraint_state.candidates[6, i_b] = 2.0
-            else:
-                # Branch A: grid found no improvement — check grad(0) cooperatively
-                alpha_eval = gs.qd_float(0.0)
-                local_qt1 = gs.qd_float(0.0)
-                local_qt2 = gs.qd_float(0.0)
-                i_c = ne + tid
-                while i_c < n_con:
-                    Jaref_c = constraint_state.Jaref[i_c, i_b]
-                    jv_c = constraint_state.jv[i_c, i_b]
-                    D = constraint_state.efc_D[i_c, i_b]
-                    if i_c < nef:
-                        f_val = constraint_state.efc_frictionloss[i_c, i_b]
-                        r_val = constraint_state.diag[i_c, i_b]
-                        rf = r_val * f_val
-                        linear_neg = Jaref_c <= -rf
-                        linear_pos = Jaref_c >= rf
-                        qf_1 = D * (jv_c * Jaref_c)
-                        qf_2 = D * (0.5 * jv_c * jv_c)
-                        if linear_neg or linear_pos:
-                            qf_1 = linear_neg * (-f_val * jv_c) + linear_pos * (f_val * jv_c)
-                            qf_2 = 0.0
-                        local_qt1 = local_qt1 + qf_1
-                        local_qt2 = local_qt2 + qf_2
-                    else:
-                        act = Jaref_c < 0
-                        local_qt1 = local_qt1 + D * (jv_c * Jaref_c) * act
-                        local_qt2 = local_qt2 + D * (0.5 * jv_c * jv_c) * act
-                    i_c += _K
-
-                sh_val[tid] = local_qt1
-                sh_val2[tid] = local_qt2
-                qd.simt.block.sync()
-                stride = _K // 2
-                while stride > 0:
-                    if tid < stride:
-                        sh_val[tid] += sh_val[tid + stride]
-                        sh_val2[tid] += sh_val2[tid + stride]
-                    qd.simt.block.sync()
-                    stride //= 2
-
-                if tid == 0:
-                    qt1_a = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b] + sh_val[0]
-                    g_0 = qt1_a  # grad at alpha=0: qt1 (since 2*0*qt2 + qt1 = qt1)
-                    if g_0 < -gtol:
-                        # Branch A2: cost descending at 0, optimal alpha likely in [0, lo] or beyond
-                        constraint_state.candidates[6, i_b] = 1.0
         else:
             if tid == 0:
                 constraint_state.candidates[0, i_b] = 0.0
@@ -644,84 +593,6 @@ def _kernel_parallel_linesearch_eval(
                 while i_c < n_con_apply:
                     constraint_state.Jaref[i_c, i_b] += constraint_state.jv[i_c, i_b] * alpha_apply
                     i_c += _K
-
-
-# ============================================ Conditional expansion kernel ==========================================
-
-
-@qd.kernel(fastcache=gs.use_fastcache)
-def _kernel_parallel_linesearch_expand(
-    constraint_state: array_class.ConstraintState,
-    rigid_global_info: array_class.RigidGlobalInfo,
-    static_rigid_sim_config: qd.template(),
-):
-    """Expansion + bisection for flagged envs only. Applies the delta to qacc/Ma/Jaref.
-
-    candidates[6]: 0=skip, 1=Branch A2, 2=Branch B2.
-    Only envs with flag != 0 do work. Most envs skip immediately (near-zero overhead).
-    After finding a better alpha, applies the correction (delta_alpha) to state.
-    """
-    _B = constraint_state.grad.shape[1]
-    n_dofs = constraint_state.qacc.shape[0]
-    _AMAX = gs.qd_float(qd.static(LS_ALPHA_MAX))
-
-    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
-    for i_b in range(_B):
-        flag = constraint_state.candidates[6, i_b]
-        if flag > 0.5:
-            p0_cost = constraint_state.candidates[1, i_b]
-            lo = constraint_state.candidates[2, i_b]
-            gtol = constraint_state.candidates[7, i_b]
-            old_alpha = constraint_state.candidates[0, i_b]
-            n_con = constraint_state.n_constraints[i_b]
-
-            # Starting point for expansion
-            exp_a = old_alpha
-            exp_alpha = lo if flag < 1.5 else old_alpha * 4.0
-            new_alpha = old_alpha
-
-            for _exp_step in range(4):
-                if exp_alpha >= _AMAX:
-                    break
-                c_exp, g_exp = _ls_eval_cost_grad(exp_alpha, i_b, constraint_state)
-                if g_exp > 0.0:
-                    # Found bracket [exp_a, exp_alpha] — bisect
-                    bis_a = exp_a
-                    bis_b = exp_alpha
-                    for _bis_it in range(8):
-                        mid_b = (bis_a + bis_b) * 0.5
-                        c_mid_b, g_mid_b = _ls_eval_cost_grad(mid_b, i_b, constraint_state)
-                        if qd.abs(g_mid_b) < gtol or qd.abs(bis_b - bis_a) < rigid_global_info.EPS[None]:
-                            break
-                        if g_mid_b < 0.0:
-                            bis_a = mid_b
-                        else:
-                            bis_b = mid_b
-                    mid_b = (bis_a + bis_b) * 0.5
-                    c_mid_b, _ = _ls_eval_cost_grad(mid_b, i_b, constraint_state)
-                    if c_mid_b < p0_cost:
-                        new_alpha = mid_b
-                        constraint_state.candidates[4, i_b] = c_mid_b
-                    break
-                elif c_exp < p0_cost:
-                    new_alpha = exp_alpha
-                    constraint_state.candidates[4, i_b] = c_exp
-                exp_a = exp_alpha
-                exp_alpha = qd.min(exp_alpha * 4.0, _AMAX)
-
-            # Apply the delta correction to qacc, Ma, Jaref
-            delta_alpha = new_alpha - old_alpha
-            if qd.abs(delta_alpha) > rigid_global_info.EPS[None]:
-                constraint_state.candidates[0, i_b] = new_alpha
-                for i_d in range(n_dofs):
-                    constraint_state.qacc[i_d, i_b] += constraint_state.search[i_d, i_b] * delta_alpha
-                    constraint_state.Ma[i_d, i_b] += constraint_state.mv[i_d, i_b] * delta_alpha
-                for i_c in range(n_con):
-                    constraint_state.Jaref[i_c, i_b] += constraint_state.jv[i_c, i_b] * delta_alpha
-                if old_alpha <= 0.0:
-                    # Was not improved before, now it is
-                    constraint_state.improved[i_b] = True
-            constraint_state.candidates[6, i_b] = 0.0
 
 
 # ============================================== Shared iteration kernels ==============================================
@@ -982,14 +853,8 @@ def func_solve_decomposed(
             rigid_global_info,
             static_rigid_sim_config,
         )
-        # Fused: grid search + bisection + apply alpha (sets expansion flag if needed)
+        # Fused: grid search + bisection + apply alpha
         _kernel_parallel_linesearch_eval(
-            constraint_state,
-            rigid_global_info,
-            static_rigid_sim_config,
-        )
-        # Conditional expansion: only envs with candidates[6]>0 do work, rest skip instantly
-        _kernel_parallel_linesearch_expand(
             constraint_state,
             rigid_global_info,
             static_rigid_sim_config,
