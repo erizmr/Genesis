@@ -76,191 +76,78 @@ JOINT_SHORT = [
 # Thermal constants (per joint in eden order)
 # Columns: R (winding resistance), C (thermal capacitance), k (cooling coeff)
 # Grouped by actuator size: legs > waist > shoulders > elbows > wrists
+# Columns: R (winding resistance), C (thermal capacitance), k (cooling coeff)
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Motor & thermal parameters (eden DOF order)
-# ---------------------------------------------------------------------------
-# PD gains from the RL controller (extracted from dataset env config)
 # fmt: off
-KP = np.array([
+JOINT_THERMAL = np.array([
     # Left leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
-    99.098, 99.098, 40.179, 99.098, 28.501, 28.501,
-    # Right leg
-    99.098, 99.098, 40.179, 99.098, 28.501, 28.501,
+    [2.5, 15.0, 1.2],  [2.0, 12.0, 1.0],  [1.8, 12.0, 1.0],
+    [3.0, 18.0, 1.5],  [1.5, 10.0, 0.8],  [1.2, 8.0,  0.7],
+    # Right leg: same pattern
+    [2.5, 15.0, 1.2],  [2.0, 12.0, 1.0],  [1.8, 12.0, 1.0],
+    [3.0, 18.0, 1.5],  [1.5, 10.0, 0.8],  [1.2, 8.0,  0.7],
     # Waist: yaw, roll, pitch
-    40.179, 28.501, 28.501,
+    [1.5, 20.0, 1.0],  [1.5, 20.0, 1.0],  [1.8, 20.0, 1.0],
     # Left arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow
-    14.251, 14.251, 14.251, 14.251,
+    [1.5, 10.0, 0.9],  [1.5, 10.0, 0.9],  [1.2, 8.0,  0.8],
+    [1.8, 8.0,  1.0],
     # Left wrist: roll, pitch, yaw
-    14.251, 16.778, 16.778,
-    # Right arm
-    14.251, 14.251, 14.251, 14.251,
-    # Right wrist
-    14.251, 16.778, 16.778,
-], dtype=np.float32)
-
-KD = np.array([
-    # Left leg
-    6.309, 6.309, 2.558, 6.309, 1.814, 1.814,
-    # Right leg
-    6.309, 6.309, 2.558, 6.309, 1.814, 1.814,
-    # Waist
-    2.558, 1.814, 1.814,
-    # Left arm
-    0.907, 0.907, 0.907, 0.907,
-    # Left wrist
-    0.907, 1.068, 1.068,
-    # Right arm
-    0.907, 0.907, 0.907, 0.907,
-    # Right wrist
-    0.907, 1.068, 1.068,
-], dtype=np.float32)
-
-# Actuator force limits from MJCF (Nm) — used to clamp torque estimate
-FORCE_LIMIT = np.array([
-    # Left leg
-    88, 139, 88, 139, 50, 50,
-    # Right leg
-    88, 139, 88, 139, 50, 50,
-    # Waist
-    88, 50, 50,
-    # Left arm
-    25, 25, 25, 25, 25, 5, 5,
-    # Right arm
-    25, 25, 25, 25, 25, 5, 5,
-], dtype=np.float32)
-
-# Effective motor constant K_eff = K_t * gear_ratio (Nm/A at joint output).
-# This converts joint torque to motor current: I = tau / K_eff.
-# Humanoid actuators use geared BLDC motors. Typical:
-#   Motor K_t ~ 0.05-0.1 Nm/A, gear ratio ~ 30-50:1 for legs, ~10-20:1 for arms.
-#   So K_eff = K_t * gear = 0.05 * 40 = 2.0 Nm/A for legs.
-# Result: 88 Nm joint torque → I = 88/6.0 ≈ 15A (realistic for humanoid).
-K_EFF = np.array([
-    # Left leg: high gear ratio
-    6.0, 8.0, 5.0, 8.0, 4.0, 4.0,
-    # Right leg
-    6.0, 8.0, 5.0, 8.0, 4.0, 4.0,
-    # Waist
-    5.0, 4.0, 4.0,
-    # Left arm: lower gear ratio
-    2.5, 2.5, 2.5, 2.5, 2.0, 1.0, 1.0,
-    # Right arm
-    2.5, 2.5, 2.5, 2.5, 2.0, 1.0, 1.0,
-], dtype=np.float32)
-
-# Winding resistance R (ohms). Reflects motor coil resistance.
-# Leg motors: larger coils, lower R. Wrist motors: smaller coils, higher R.
-R_WINDING = np.array([
-    # Left leg
-    0.5, 0.4, 0.5, 0.4, 0.8, 0.8,
-    # Right leg
-    0.5, 0.4, 0.5, 0.4, 0.8, 0.8,
-    # Waist
-    0.5, 0.8, 0.8,
-    # Left arm
-    1.2, 1.2, 1.2, 1.2, 1.5, 2.5, 2.5,
-    # Right arm
-    1.2, 1.2, 1.2, 1.2, 1.5, 2.5, 2.5,
-], dtype=np.float32)
-
-# Thermal capacitance C (J/K). Larger motors = more thermal mass.
-C_THERMAL = np.array([
-    # Left leg
-    15.0, 12.0, 12.0, 18.0, 10.0, 8.0,
-    # Right leg
-    15.0, 12.0, 12.0, 18.0, 10.0, 8.0,
-    # Waist
-    20.0, 20.0, 20.0,
-    # Left arm
-    10.0, 10.0, 8.0, 8.0, 6.0, 6.0, 6.0,
-    # Right arm
-    10.0, 10.0, 8.0, 8.0, 6.0, 6.0, 6.0,
-], dtype=np.float32)
-
-# Cooling coefficient k (W/K). Passive convection.
-K_COOL = np.array([
-    # Left leg
-    1.2, 1.0, 1.0, 1.5, 0.8, 0.7,
-    # Right leg
-    1.2, 1.0, 1.0, 1.5, 0.8, 0.7,
-    # Waist
-    1.0, 1.0, 1.0,
-    # Left arm
-    0.9, 0.9, 0.8, 1.0, 0.8, 0.8, 0.8,
-    # Right arm
-    0.9, 0.9, 0.8, 1.0, 0.8, 0.8, 0.8,
+    [0.8, 6.0,  0.8],  [0.8, 6.0,  0.8],  [0.8, 6.0,  0.8],
+    # Right arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow
+    [1.5, 10.0, 0.9],  [1.5, 10.0, 0.9],  [1.2, 8.0,  0.8],
+    [1.8, 8.0,  1.0],
+    # Right wrist: roll, pitch, yaw
+    [0.8, 6.0,  0.8],  [0.8, 6.0,  0.8],  [0.8, 6.0,  0.8],
 ], dtype=np.float32)
 # fmt: on
 
-FRICTION = 0.01  # viscous friction heating coefficient (W/(Nm * rad/s))
-K_CONDUCTION = 2.0  # inter-joint conduction rate (W/K) — heat flows along kinematic chain
 T_AMBIENT = 25.0
 WARN_TEMP = 55.0
 CRIT_TEMP = 75.0
 MAX_TEMP = 100.0
 
-# Kinematic chain adjacency (eden DOF indices): parent -> child pairs.
-# Heat conducts between neighboring joints in the kinematic tree.
-# fmt: off
-JOINT_ADJACENCY = [
-    # Left leg chain: hip_pitch -> hip_roll -> hip_yaw -> knee -> ankle_pitch -> ankle_roll
-    (0, 1), (1, 2), (2, 3), (3, 4), (4, 5),
-    # Right leg chain
-    (6, 7), (7, 8), (8, 9), (9, 10), (10, 11),
-    # Waist chain: yaw -> roll -> pitch
-    (12, 13), (13, 14),
-    # Left arm chain: shoulder_pitch -> shoulder_roll -> shoulder_yaw -> elbow -> wrist_roll -> wrist_pitch -> wrist_yaw
-    (15, 16), (16, 17), (17, 18), (18, 19), (19, 20), (20, 21),
-    # Right arm chain
-    (22, 23), (23, 24), (24, 25), (25, 26), (26, 27), (27, 28),
-]
-# fmt: on
+# Heat generation scale: maps (effort^2) to watts per joint group.
+# effort = |action - current_pos| (radians) + velocity_contribution
+# Tuned so locomotion reaches ~60-80C over 14s.
+HEAT_SCALE = np.array([
+    # Left leg: hip(p,r,y), knee, ankle(p,r)
+    12.0, 8.0, 6.0, 18.0, 8.0, 5.0,
+    # Right leg
+    12.0, 8.0, 6.0, 18.0, 8.0, 5.0,
+    # Waist
+    5.0, 5.0, 6.0,
+    # Left arm: shoulder(p,r,y), elbow, wrist(r,p,y)
+    4.0, 4.0, 3.0, 5.0, 0.5, 0.5, 0.5,
+    # Right arm
+    4.0, 4.0, 3.0, 5.0, 0.5, 0.5, 0.5,
+], dtype=np.float32)
+
+VEL_HEAT_SCALE = 0.3  # contribution of |velocity| to heating
 
 
 # ---------------------------------------------------------------------------
 # Thermal model
 # ---------------------------------------------------------------------------
 class ThermalModel:
-    """Motor thermal model for 29 DOFs.
+    """Standalone motor thermal model for 29 DOFs.
 
-    Physics:
-        1. Estimate torque:  tau = clip(Kp*(action-qpos) - Kd*vel, force_limit)
-        2. Compute current:  I = tau / K_eff
-        3. Compute heat:     P = I^2 * R_winding + |tau| * |vel| * friction
-        4. Thermal dynamics: dT = (P - k*(T - T_amb)) / C * dt
-        5. Conduction:       heat flows between adjacent joints in kinematic chain
+    Uses effort-based heating: effort = |action - current_pos| + vel_scale * |vel|.
+    P_heat = HEAT_SCALE * effort^2
+    dT = (P_heat - k * (T - T_amb)) / C * dt
     """
 
     def __init__(self, t_ambient=T_AMBIENT, cooling=1.0):
         self.t_amb = t_ambient
         self.temps = np.full(29, t_ambient, dtype=np.float32)
-        self.k = K_COOL * cooling
+        self.C = JOINT_THERMAL[:, 1]       # thermal capacitance
+        self.k = JOINT_THERMAL[:, 2] * cooling  # cooling coefficient
 
     def step(self, action, qpos_dofs, velocities, dt):
-        """Update joint temperatures from action targets, positions, and velocities."""
-        # 1. Torque estimate from PD controller, clamped by actuator force limits
-        tau = KP * (action - qpos_dofs) - KD * velocities
-        tau = np.clip(tau, -FORCE_LIMIT, FORCE_LIMIT)
-
-        # 2. Motor current: I = tau_joint / K_eff where K_eff = K_t * gear_ratio
-        I = tau / K_EFF
-
-        # 3. Heat power: I^2*R (Joule heating) + mechanical friction
-        P_heat = I**2 * R_WINDING + np.abs(tau) * np.abs(velocities) * FRICTION
-
-        # 4. Thermal dynamics: heating minus passive cooling
-        dT = (P_heat - self.k * (self.temps - self.t_amb)) / C_THERMAL * dt
-        self.temps += dT
-
-        # 5. Inter-joint conduction: heat flows from hot to cold along kinematic chain
-        for parent, child in JOINT_ADJACENCY:
-            delta = self.temps[parent] - self.temps[child]
-            flux = K_CONDUCTION * delta * dt
-            self.temps[parent] -= flux / C_THERMAL[parent]
-            self.temps[child] += flux / C_THERMAL[child]
-
-        self.temps = np.clip(self.temps, self.t_amb, MAX_TEMP)
+        """Update temperatures given action targets, current positions, and velocities."""
+        effort = np.abs(action - qpos_dofs) + VEL_HEAT_SCALE * np.abs(velocities)
+        P_heat = HEAT_SCALE * effort**2
+        dT = (P_heat - self.k * (self.temps - self.t_amb)) / self.C * dt
+        self.temps = np.clip(self.temps + dT, self.t_amb, MAX_TEMP)
         return self.temps.copy()
 
 
@@ -402,13 +289,11 @@ def build_thermal_mesh_info(robot):
         combined_verts = np.concatenate(all_verts, axis=0)
         combined_faces = np.concatenate(all_faces, axis=0)
 
-        # Compute heat proximity weight: 1.0 at joint origin (hottest), decays with distance.
-        # Heat radiates from the motor at the joint origin outward.
-        # Floor of 0.3 ensures the entire link shows some warmth from its motor.
+        # Compute blend weights: 0 = joint origin (parent temp), 1 = far end (own temp)
+        # Distance from origin along the link's principal axis
         dists = np.linalg.norm(combined_verts, axis=1)
         max_dist = max(dists.max(), 1e-6)
-        normalized = dists / max_dist
-        heat_weight = np.clip(1.0 - normalized ** 0.8, 0.3, 1.0)
+        blend = np.clip(dists / max_dist, 0, 1)
 
         mesh_infos.append({
             "eden_idx": eden_idx,
@@ -416,7 +301,7 @@ def build_thermal_mesh_info(robot):
             "link": link,
             "local_verts": combined_verts.astype(np.float64),
             "faces": combined_faces,
-            "heat_weight": heat_weight.astype(np.float32),
+            "blend_weights": blend.astype(np.float32),
         })
 
     total_verts = sum(len(m["local_verts"]) for m in mesh_infos)
@@ -438,7 +323,8 @@ def build_thermal_debug_mesh(mesh_infos, temps, robot):
     for info in mesh_infos:
         link = info["link"]
         eden_idx = info["eden_idx"]
-        heat_weight = info["heat_weight"]
+        parent_eden = info["parent_eden_idx"]
+        blend = info["blend_weights"]
 
         # Get link world transform
         link_pos = link.get_pos().cpu().numpy().reshape(3).astype(np.float64)
@@ -449,9 +335,12 @@ def build_thermal_debug_mesh(mesh_infos, temps, robot):
         local_verts = info["local_verts"]
         world_verts = (link_T[:3, :3] @ local_verts.T).T + link_T[:3, 3]
 
-        # Per-vertex temperature: hot at joint origin, ambient far away
-        joint_temp = temps[eden_idx]
-        vertex_temps = T_AMBIENT + heat_weight * (joint_temp - T_AMBIENT)
+        # Interpolate temperature per vertex
+        # Near joint origin (blend~0): parent joint temperature
+        # Far end (blend~1): this joint's own temperature
+        own_temp = temps[eden_idx]
+        parent_temp = temps[parent_eden] if parent_eden is not None else T_AMBIENT
+        vertex_temps = parent_temp * (1 - blend) + own_temp * blend
 
         # Per-face color (average of 3 vertex colors)
         vertex_rgba = temps_to_face_colors(vertex_temps)
