@@ -3466,7 +3466,7 @@ def func_solve_body(
 ) -> None: ...
 
 
-@func_solve_body.register(is_compatible=lambda *args, **kwargs: True)
+@func_solve_body.register(is_compatible=lambda *args, **kwargs: False)
 @qd.kernel(fastcache=gs.use_fastcache)
 def func_solve_body_monolith(
     entities_info: array_class.EntitiesInfo,
@@ -3497,11 +3497,7 @@ def func_solve_body_monolith(
             constraint_state.improved[i_b] = False
 
 
-@func_solve_body.register(
-    is_compatible=lambda *args, **kwargs: (
-        gs.backend in {gs.cuda} and not (args[5] if len(args) > 5 else kwargs["static_rigid_sim_config"]).requires_grad
-    )
-)
+@func_solve_body.register(is_compatible=lambda *args, **kwargs: True)
 @qd.kernel(fastcache=gs.use_fastcache)
 def func_solve_body_mono_parallel_ls(
     entities_info: array_class.EntitiesInfo,
