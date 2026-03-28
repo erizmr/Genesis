@@ -3101,6 +3101,357 @@ def func_solve_iter(
         )
 
 
+# --- Parallel linesearch constants (mono version, matching solver_breakdown.py) ---
+_MONO_PLS_MIN_STEP = 1e-6
+_MONO_PLS_BISECT_STEPS = 12
+_MONO_PLS_N_CANDIDATES = 6
+_MONO_PLS_ALPHA_MAX = 1e4
+
+
+@qd.func
+def _mono_pls_eval_cost_grad(
+    alpha,
+    i_b,
+    constraint_state: array_class.ConstraintState,
+):
+    """Compute cost and analytical gradient at alpha for mono parallel linesearch.
+
+    Reuses quad_gauss and eq_sum precomputed by func_ls_init_and_eval_p0_opt.
+    Same logic as _ls_eval_cost_grad in solver_breakdown.py but runs in single thread."""
+    ne = constraint_state.n_constraints_equality[i_b]
+    nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+    n_con = constraint_state.n_constraints[i_b]
+
+    qt_0 = constraint_state.quad_gauss[0, i_b] + constraint_state.eq_sum[0, i_b]
+    qt_1 = constraint_state.quad_gauss[1, i_b] + constraint_state.eq_sum[1, i_b]
+    qt_2 = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b]
+
+    for i_c in range(ne, nef):
+        Jaref_c = constraint_state.Jaref[i_c, i_b]
+        jv_c = constraint_state.jv[i_c, i_b]
+        D = constraint_state.efc_D[i_c, i_b]
+        f_val = constraint_state.efc_frictionloss[i_c, i_b]
+        r_val = constraint_state.diag[i_c, i_b]
+        qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+        qf_1 = D * (jv_c * Jaref_c)
+        qf_2 = D * (0.5 * jv_c * jv_c)
+        x = Jaref_c + alpha * jv_c
+        rf = r_val * f_val
+        linear_neg = x <= -rf
+        linear_pos = x >= rf
+        if linear_neg or linear_pos:
+            qf_0 = linear_neg * f_val * (-0.5 * rf - Jaref_c) + linear_pos * f_val * (-0.5 * rf + Jaref_c)
+            qf_1 = linear_neg * (-f_val * jv_c) + linear_pos * (f_val * jv_c)
+            qf_2 = 0.0
+        qt_0 = qt_0 + qf_0
+        qt_1 = qt_1 + qf_1
+        qt_2 = qt_2 + qf_2
+
+    for i_c in range(nef, n_con):
+        Jaref_c = constraint_state.Jaref[i_c, i_b]
+        jv_c = constraint_state.jv[i_c, i_b]
+        D = constraint_state.efc_D[i_c, i_b]
+        x = Jaref_c + alpha * jv_c
+        active = x < 0
+        qf_0 = D * (0.5 * Jaref_c * Jaref_c)
+        qf_1 = D * (jv_c * Jaref_c)
+        qf_2 = D * (0.5 * jv_c * jv_c)
+        qt_0 = qt_0 + qf_0 * active
+        qt_1 = qt_1 + qf_1 * active
+        qt_2 = qt_2 + qf_2 * active
+
+    cost = alpha * alpha * qt_2 + alpha * qt_1 + qt_0
+    grad = 2.0 * alpha * qt_2 + qt_1
+    return cost, grad
+
+
+@qd.func
+def _mono_pls_eval_cost(
+    alpha,
+    i_b,
+    constraint_state: array_class.ConstraintState,
+):
+    """Compute cost at alpha (without gradient) for candidate evaluation.
+
+    Uses quad_gauss + eq_sum for DOF and equality parts, loops over friction+contact."""
+    ne = constraint_state.n_constraints_equality[i_b]
+    nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+    n_con = constraint_state.n_constraints[i_b]
+
+    # DOF + equality cost from precomputed quad coefficients
+    dof_eq_cost = (
+        alpha * alpha * constraint_state.quad_gauss[2, i_b]
+        + alpha * constraint_state.quad_gauss[1, i_b]
+        + constraint_state.quad_gauss[0, i_b]
+        + alpha * alpha * constraint_state.eq_sum[2, i_b]
+        + alpha * constraint_state.eq_sum[1, i_b]
+        + constraint_state.eq_sum[0, i_b]
+    )
+
+    # Friction + contact constraints
+    con_cost = gs.qd_float(0.0)
+    for i_c in range(ne, n_con):
+        Jaref_c = constraint_state.Jaref[i_c, i_b]
+        jv_c = constraint_state.jv[i_c, i_b]
+        D = constraint_state.efc_D[i_c, i_b]
+        x = Jaref_c + alpha * jv_c
+        if i_c < nef:
+            f_val = constraint_state.efc_frictionloss[i_c, i_b]
+            r_val = constraint_state.diag[i_c, i_b]
+            rf = r_val * f_val
+            linear_neg = x <= -rf
+            linear_pos = x >= rf
+            if linear_neg or linear_pos:
+                con_cost = con_cost + linear_neg * f_val * (-0.5 * rf - Jaref_c - alpha * jv_c)
+                con_cost = con_cost + linear_pos * f_val * (-0.5 * rf + Jaref_c + alpha * jv_c)
+            else:
+                con_cost = con_cost + D * 0.5 * x * x
+        else:
+            if x < 0:
+                con_cost = con_cost + D * 0.5 * x * x
+
+    return dof_eq_cost + con_cost
+
+
+@qd.func
+def func_parallel_linesearch_batch(
+    i_b,
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Parallel-style linesearch for mono solver: grid search + Newton correction + bisection.
+
+    Same algorithm as the decomp parallel linesearch but runs entirely in a single thread per env.
+    Reuses func_ls_init_and_eval_p0_opt for mv/jv/quad_gauss/eq_sum computation.
+
+    Algorithm:
+    1. Init: compute mv, jv, quad_gauss, eq_sum, p0 cost (via existing func_ls_init_and_eval_p0_opt)
+    2. Compute Newton step estimate, set up log-spaced search range
+    3. Grid search: evaluate N_CANDIDATES log-spaced alphas + Newton alpha, pick best
+    4. Refine: try Newton correction, fall back to gradient bisection if needed
+    """
+    _NC = qd.static(_MONO_PLS_N_CANDIDATES)
+
+    # Phase 1: Init + p0 eval (reuse existing optimized function)
+    p0_alpha, p0_cost, p0_deriv_0, p0_deriv_1 = func_ls_init_and_eval_p0_opt(
+        i_b,
+        entities_info=entities_info,
+        dofs_state=dofs_state,
+        constraint_state=constraint_state,
+        rigid_global_info=rigid_global_info,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
+
+    # Compute snorm for gtol
+    n_dofs = constraint_state.search.shape[0]
+    snorm = gs.qd_float(0.0)
+    for jd in range(n_dofs):
+        snorm = snorm + constraint_state.search[jd, i_b] ** 2
+    snorm = qd.sqrt(snorm)
+
+    res_alpha = gs.qd_float(0.0)
+
+    if snorm < rigid_global_info.EPS[None]:
+        constraint_state.ls_result[i_b] = 1
+    else:
+        scale = rigid_global_info.meaninertia[i_b] * qd.max(1, n_dofs)
+        gtol = rigid_global_info.tolerance[None] * rigid_global_info.ls_tolerance[None] * snorm * scale
+        constraint_state.gtol[i_b] = gtol
+
+        # Compute Newton step estimate using full gradient and hessian
+        # p0_deriv_0 = total gradient at alpha=0, p0_deriv_1 = total hessian at alpha=0
+        alpha_newton = gs.qd_float(qd.static(_MONO_PLS_MIN_STEP))
+        if p0_deriv_1 > 0.0:
+            alpha_newton = qd.max(qd.abs(p0_deriv_0 / p0_deriv_1), gs.qd_float(qd.static(_MONO_PLS_MIN_STEP)))
+
+        # Set up log-spaced search range centered on Newton step
+        lo = alpha_newton * 1e-2
+        hi = alpha_newton * 10.0
+
+        # Phase 2: Grid search - evaluate N_CANDIDATES log-spaced alphas + Newton alpha
+        log_lo = qd.log(lo)
+        cand_step = (qd.log(hi) - log_lo) / qd.max(1.0, qd.cast(_NC - 1, gs.qd_float))
+
+        best_alpha = gs.qd_float(0.0)
+        best_cost = p0_cost
+
+        for cand_idx in range(_NC + 1):
+            alpha_c = gs.qd_float(0.0)
+            if cand_idx < _NC:
+                alpha_c = qd.exp(log_lo + qd.cast(cand_idx, gs.qd_float) * cand_step)
+            else:
+                alpha_c = alpha_newton
+
+            c = _mono_pls_eval_cost(alpha_c, i_b, constraint_state)
+            if c < best_cost:
+                best_cost = c
+                best_alpha = alpha_c
+
+        # Phase 3: Refinement if we found a candidate better than p0
+        if best_alpha > 0.0:
+            # Compute gradient at best alpha
+            _, g_best = _mono_pls_eval_cost_grad(best_alpha, i_b, constraint_state)
+
+            if qd.abs(g_best) > gtol:
+                # Try Newton correction
+                ne = constraint_state.n_constraints_equality[i_b]
+                nef = ne + constraint_state.n_constraints_frictionloss[i_b]
+                n_con = constraint_state.n_constraints[i_b]
+
+                # Compute hessian at best_alpha
+                qt_2 = constraint_state.quad_gauss[2, i_b] + constraint_state.eq_sum[2, i_b]
+                for i_c in range(ne, nef):
+                    Jaref_c = constraint_state.Jaref[i_c, i_b]
+                    jv_c = constraint_state.jv[i_c, i_b]
+                    D = constraint_state.efc_D[i_c, i_b]
+                    f_val = constraint_state.efc_frictionloss[i_c, i_b]
+                    r_val = constraint_state.diag[i_c, i_b]
+                    x = Jaref_c + best_alpha * jv_c
+                    rf = r_val * f_val
+                    linear_neg = x <= -rf
+                    linear_pos = x >= rf
+                    if not (linear_neg or linear_pos):
+                        qt_2 = qt_2 + D * (0.5 * jv_c * jv_c)
+                for i_c in range(nef, n_con):
+                    Jaref_c = constraint_state.Jaref[i_c, i_b]
+                    jv_c = constraint_state.jv[i_c, i_b]
+                    D = constraint_state.efc_D[i_c, i_b]
+                    x = Jaref_c + best_alpha * jv_c
+                    if x < 0:
+                        qt_2 = qt_2 + D * (0.5 * jv_c * jv_c)
+
+                hess_best = 2.0 * qt_2
+                newton_done = False
+
+                if hess_best > rigid_global_info.EPS[None]:
+                    alpha_nc = best_alpha - g_best / hess_best
+                    if alpha_nc > 0.0:
+                        c_nc, g_nc = _mono_pls_eval_cost_grad(alpha_nc, i_b, constraint_state)
+                        if c_nc < p0_cost and c_nc < best_cost:
+                            best_alpha = alpha_nc
+                            best_cost = c_nc
+                            newton_done = True
+
+                if not newton_done:
+                    # Gradient bisection
+                    bis_a = best_alpha * 0.5
+                    bis_b = best_alpha
+                    if g_best < 0.0:
+                        bis_a = best_alpha
+                        bis_b = best_alpha * 2.0
+
+                    _, g_a = _mono_pls_eval_cost_grad(bis_a, i_b, constraint_state)
+                    _, g_b = _mono_pls_eval_cost_grad(bis_b, i_b, constraint_state)
+
+                    if g_a < 0.0 and g_b > 0.0:
+                        _N_BISECT = qd.static(_MONO_PLS_BISECT_STEPS)
+                        for _bis_it in range(_N_BISECT):
+                            mid = (bis_a + bis_b) * 0.5
+                            c_mid, g_mid = _mono_pls_eval_cost_grad(mid, i_b, constraint_state)
+                            if qd.abs(g_mid) < gtol or qd.abs(bis_b - bis_a) < rigid_global_info.EPS[None]:
+                                break
+                            if g_mid < 0.0:
+                                bis_a = mid
+                            else:
+                                bis_b = mid
+                        mid = (bis_a + bis_b) * 0.5
+                        c_mid, _ = _mono_pls_eval_cost_grad(mid, i_b, constraint_state)
+                        if c_mid < p0_cost and c_mid < best_cost:
+                            best_alpha = mid
+                            best_cost = c_mid
+
+        res_alpha = best_alpha
+
+    return res_alpha
+
+
+@qd.func
+def func_solve_iter_parallel_ls(
+    i_b,
+    entities_info: array_class.EntitiesInfo,
+    dofs_state: array_class.DofsState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Single solver iteration using parallel linesearch algorithm (mono version).
+
+    Identical to func_solve_iter except uses func_parallel_linesearch_batch
+    instead of func_linesearch_batch."""
+    n_dofs = constraint_state.qacc.shape[0]
+    alpha = func_parallel_linesearch_batch(
+        i_b,
+        entities_info=entities_info,
+        dofs_state=dofs_state,
+        rigid_global_info=rigid_global_info,
+        constraint_state=constraint_state,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
+
+    if qd.abs(alpha) < rigid_global_info.EPS[None]:
+        constraint_state.improved[i_b] = False
+    else:
+        for i_d in range(n_dofs):
+            constraint_state.qacc[i_d, i_b] = (
+                constraint_state.qacc[i_d, i_b] + constraint_state.search[i_d, i_b] * alpha
+            )
+            constraint_state.Ma[i_d, i_b] = constraint_state.Ma[i_d, i_b] + constraint_state.mv[i_d, i_b] * alpha
+
+        for i_c in range(constraint_state.n_constraints[i_b]):
+            constraint_state.Jaref[i_c, i_b] = constraint_state.Jaref[i_c, i_b] + constraint_state.jv[i_c, i_b] * alpha
+
+        if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.CG):
+            for i_d in range(n_dofs):
+                constraint_state.cg_prev_grad[i_d, i_b] = constraint_state.grad[i_d, i_b]
+                constraint_state.cg_prev_Mgrad[i_d, i_b] = constraint_state.Mgrad[i_d, i_b]
+
+        func_update_constraint_batch(
+            i_b,
+            qacc=constraint_state.qacc,
+            Ma=constraint_state.Ma,
+            cost=constraint_state.cost,
+            dofs_state=dofs_state,
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+
+        if qd.static(static_rigid_sim_config.solver_type == gs.constraint_solver.Newton):
+            func_build_changed_constraint_list(i_b, constraint_state=constraint_state)
+            is_degenerated = func_hessian_and_cholesky_factor_incremental_batch(
+                i_b,
+                constraint_state=constraint_state,
+                rigid_global_info=rigid_global_info,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+            if is_degenerated:
+                func_hessian_and_cholesky_factor_direct_batch(
+                    i_b,
+                    entities_info=entities_info,
+                    constraint_state=constraint_state,
+                    rigid_global_info=rigid_global_info,
+                    static_rigid_sim_config=static_rigid_sim_config,
+                )
+
+        func_update_gradient_batch(
+            i_b,
+            dofs_state=dofs_state,
+            entities_info=entities_info,
+            rigid_global_info=rigid_global_info,
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+
+        func_terminate_or_update_descent_batch(
+            i_b,
+            constraint_state=constraint_state,
+            rigid_global_info=rigid_global_info,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+
+
 @qd.perf_dispatch(
     get_geometry_hash=lambda *args, **kwargs: (*args, frozendict(kwargs)), warmup=1, active=1, repeat_after_seconds=5
 )
@@ -3133,6 +3484,46 @@ def func_solve_body_monolith(
         if constraint_state.n_constraints[i_b] > 0:
             for _ in range(rigid_global_info.iterations[None]):
                 func_solve_iter(
+                    i_b,
+                    entities_info=entities_info,
+                    dofs_state=dofs_state,
+                    rigid_global_info=rigid_global_info,
+                    constraint_state=constraint_state,
+                    static_rigid_sim_config=static_rigid_sim_config,
+                )
+                if not constraint_state.improved[i_b]:
+                    break
+        else:
+            constraint_state.improved[i_b] = False
+
+
+@func_solve_body.register(
+    is_compatible=lambda *args, **kwargs: (
+        gs.backend in {gs.cuda} and not (args[5] if len(args) > 5 else kwargs["static_rigid_sim_config"]).requires_grad
+    )
+)
+@qd.kernel(fastcache=gs.use_fastcache)
+def func_solve_body_mono_parallel_ls(
+    entities_info: array_class.EntitiesInfo,
+    dofs_info: array_class.DofsInfo,
+    dofs_state: array_class.DofsState,
+    constraint_state: array_class.ConstraintState,
+    rigid_global_info: array_class.RigidGlobalInfo,
+    static_rigid_sim_config: qd.template(),
+    _n_iterations: int,
+):
+    """Monolith solver using parallel linesearch (grid search + bisection).
+
+    Same single-kernel structure as func_solve_body_monolith but replaces the iterative
+    Newton-guided linesearch with the grid search + bisection algorithm from the decomp solver.
+    This decouples the linesearch strategy from the mono/decomp dispatch decision."""
+    _B = constraint_state.grad.shape[1]
+
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL, block_dim=32)
+    for i_b in range(_B):
+        if constraint_state.n_constraints[i_b] > 0:
+            for _ in range(rigid_global_info.iterations[None]):
+                func_solve_iter_parallel_ls(
                     i_b,
                     entities_info=entities_info,
                     dofs_state=dofs_state,
