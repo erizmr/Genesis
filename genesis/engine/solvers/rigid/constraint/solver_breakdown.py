@@ -836,13 +836,14 @@ def _kernel_linesearch(
 # ============================================== Solve body dispatch ================================================
 
 
-@solver.func_solve_body.register(
-    is_compatible=lambda *args, **kwargs: (
-        # Note: we do not use parallel linesearch for finite difference gradient validation, as it is highly
-        # sensitive to numerical precision and GPU float64 rounding errors can accumulate over many trials.
-        gs.backend in {gs.cuda} and not (args[5] if len(args) > 5 else kwargs["static_rigid_sim_config"]).requires_grad
-    )
-)
+# @solver.func_solve_body.register(
+#     is_compatible=lambda *args, **kwargs: (
+#         # Note: we do not use parallel linesearch for finite difference gradient validation, as it is highly
+#         # sensitive to numerical precision and GPU float64 rounding errors can accumulate over many trials.
+#         gs.backend in {gs.cuda} and not (args[5] if len(args) > 5 else kwargs["static_rigid_sim_config"]).requires_grad
+#     )
+# )
+@solver.func_solve_body.register(is_compatible=lambda *args, **kwargs: False)
 def func_solve_decomposed(
     entities_info,
     dofs_info,
