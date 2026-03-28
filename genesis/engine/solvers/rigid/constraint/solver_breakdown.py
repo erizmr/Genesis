@@ -341,7 +341,6 @@ def _kernel_init_update_gradient(
     )
 
 
-@solver.func_solve_init.register(is_compatible=lambda *args, **kwargs: gs.backend in {gs.cuda})
 def func_solve_init_decomposed(
     dofs_info,
     dofs_state,
