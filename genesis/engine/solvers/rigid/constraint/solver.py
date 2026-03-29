@@ -3453,7 +3453,7 @@ def func_solve_iter_parallel_ls(
 
 
 @qd.perf_dispatch(
-    get_geometry_hash=lambda *args, **kwargs: (*args, frozendict(kwargs)), warmup=1, active=1, repeat_after_seconds=5
+    get_geometry_hash=lambda *args, **kwargs: (*args, frozendict(kwargs)), warmup=1, active=1, repeat_after_seconds=3
 )
 def func_solve_body(
     entities_info: array_class.EntitiesInfo,
@@ -3466,7 +3466,7 @@ def func_solve_body(
 ) -> None: ...
 
 
-@func_solve_body.register(is_compatible=lambda *args, **kwargs: False)
+@func_solve_body.register(is_compatible=lambda *args, **kwargs: True)
 @qd.kernel(fastcache=gs.use_fastcache)
 def func_solve_body_monolith(
     entities_info: array_class.EntitiesInfo,
@@ -3497,7 +3497,7 @@ def func_solve_body_monolith(
             constraint_state.improved[i_b] = False
 
 
-@func_solve_body.register(is_compatible=lambda *args, **kwargs: True)
+@func_solve_body.register(is_compatible=lambda *args, **kwargs: False)
 @qd.kernel(fastcache=gs.use_fastcache)
 def func_solve_body_mono_parallel_ls(
     entities_info: array_class.EntitiesInfo,
