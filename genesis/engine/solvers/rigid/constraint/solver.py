@@ -2702,6 +2702,7 @@ def func_update_constraint(
         )
 
 
+
 @qd.func
 def func_update_gradient_batch(
     i_b,
@@ -2887,6 +2888,31 @@ def initialize_Jaref(
 
 
 @qd.func
+def initialize_Jaref_parallel(
+    qacc: array_class.V_ANNOTATION,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    """Parallelizes over (constraints, envs) — better when GPU is not saturated by envs alone."""
+    _B = constraint_state.jac.shape[2]
+    n_dofs = constraint_state.jac.shape[1]
+    len_constraints = constraint_state.Jaref.shape[0]
+
+    qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_c, i_b in qd.ndrange(len_constraints, _B):
+        if i_c < constraint_state.n_constraints[i_b]:
+            Jaref = -constraint_state.aref[i_c, i_b]
+            if qd.static(static_rigid_sim_config.sparse_solve):
+                for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
+                    i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+                    Jaref = Jaref + constraint_state.jac[i_c, i_d, i_b] * qacc[i_d, i_b]
+            else:
+                for i_d in range(n_dofs):
+                    Jaref = Jaref + constraint_state.jac[i_c, i_d, i_b] * qacc[i_d, i_b]
+            constraint_state.Jaref[i_c, i_b] = Jaref
+
+
+@qd.func
 def initialize_Ma(
     Ma: array_class.V_ANNOTATION,
     qacc: array_class.V_ANNOTATION,
@@ -2911,21 +2937,6 @@ def initialize_Ma(
 # ======================================================= Core ========================================================
 
 
-def _get_gpu_saturation_threshold():
-    """Max concurrent warps the GPU can run — above this, envs alone saturate the GPU."""
-    if not hasattr(_get_gpu_saturation_threshold, "_cached"):
-        import torch
-
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            _get_gpu_saturation_threshold._cached = (
-                props.multi_processor_count * props.max_threads_per_multi_processor // props.warp_size
-            )
-        else:
-            _get_gpu_saturation_threshold._cached = 0  # always use monolith on non-CUDA GPUs
-    return _get_gpu_saturation_threshold._cached
-
-
 def func_solve_init(
     dofs_info,
     dofs_state,
@@ -2934,16 +2945,6 @@ def func_solve_init(
     rigid_global_info,
     static_rigid_sim_config,
 ):
-    if gs.backend is not gs.cpu and not static_rigid_sim_config.requires_grad:
-        n_envs = dofs_state.acc_smooth.shape[1]
-        if n_envs <= _get_gpu_saturation_threshold():
-            from genesis.engine.solvers.rigid.constraint.solver_breakdown import func_solve_init_decomposed
-
-            func_solve_init_decomposed(
-                dofs_info, dofs_state, entities_info, constraint_state, rigid_global_info, static_rigid_sim_config
-            )
-            return
-
     func_solve_init_monolith(
         dofs_info, dofs_state, entities_info, constraint_state, rigid_global_info, static_rigid_sim_config
     )
@@ -2972,11 +2973,18 @@ def func_solve_init_monolith(
             static_rigid_sim_config=static_rigid_sim_config,
         )
 
-        initialize_Jaref(
-            qacc=constraint_state.qacc_ws,
-            constraint_state=constraint_state,
-            static_rigid_sim_config=static_rigid_sim_config,
-        )
+        if qd.static(static_rigid_sim_config.parallel_init):
+            initialize_Jaref_parallel(
+                qacc=constraint_state.qacc_ws,
+                constraint_state=constraint_state,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+        else:
+            initialize_Jaref(
+                qacc=constraint_state.qacc_ws,
+                constraint_state=constraint_state,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
         func_update_constraint(
             qacc=constraint_state.qacc_ws,
             Ma=constraint_state.Ma_ws,
@@ -2996,11 +3004,18 @@ def func_solve_init_monolith(
             static_rigid_sim_config=static_rigid_sim_config,
         )
 
-        initialize_Jaref(
-            qacc=dofs_state.acc_smooth,
-            constraint_state=constraint_state,
-            static_rigid_sim_config=static_rigid_sim_config,
-        )
+        if qd.static(static_rigid_sim_config.parallel_init):
+            initialize_Jaref_parallel(
+                qacc=dofs_state.acc_smooth,
+                constraint_state=constraint_state,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
+        else:
+            initialize_Jaref(
+                qacc=dofs_state.acc_smooth,
+                constraint_state=constraint_state,
+                static_rigid_sim_config=static_rigid_sim_config,
+            )
         func_update_constraint(
             qacc=dofs_state.acc_smooth,
             Ma=constraint_state.Ma,
@@ -3037,11 +3052,18 @@ def func_solve_init_monolith(
         )
 
     # Initialize solver accordingly
-    initialize_Jaref(
-        qacc=constraint_state.qacc,
-        constraint_state=constraint_state,
-        static_rigid_sim_config=static_rigid_sim_config,
-    )
+    if qd.static(static_rigid_sim_config.parallel_init):
+        initialize_Jaref_parallel(
+            qacc=constraint_state.qacc,
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+    else:
+        initialize_Jaref(
+            qacc=constraint_state.qacc,
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
     func_update_constraint(
         qacc=constraint_state.qacc,
         Ma=constraint_state.Ma,
@@ -3074,6 +3096,7 @@ def func_solve_init_monolith(
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_d, i_b in qd.ndrange(n_dofs, _B):
         constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
+
 
 
 @qd.func
