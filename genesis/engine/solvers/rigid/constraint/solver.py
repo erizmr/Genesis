@@ -3098,7 +3098,6 @@ def func_solve_init_monolith(
         constraint_state.search[i_d, i_b] = -constraint_state.Mgrad[i_d, i_b]
 
 
-
 @qd.func
 def func_solve_iter(
     i_b,
@@ -3199,7 +3198,6 @@ def func_solve_body(
 
 @func_solve_body.register(
     is_compatible=lambda *args, **kwargs: _get_static_config(*args, **kwargs).prefer_parallel_linesearch != 1
-    or _get_static_config(*args, **kwargs).requires_grad
 )
 @qd.kernel(fastcache=gs.use_fastcache)
 def func_solve_body_monolith(
