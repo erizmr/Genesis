@@ -2870,25 +2870,56 @@ def initialize_Jaref(
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: qd.template(),
 ):
+    if qd.static(static_rigid_sim_config.parallel_init):
+        _initialize_Jaref_parallel(
+            qacc=constraint_state.qacc_ws,
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+    else:
+        _initialize_Jaref_per_env(
+            qacc=constraint_state.qacc_ws,
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
+
+@qd.func
+def _initialize_Jaref_body(
+    i_c,
+    i_b,
+    n_dofs,
+    qacc: array_class.V_ANNOTATION,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
+    Jaref = -constraint_state.aref[i_c, i_b]
+    if qd.static(static_rigid_sim_config.sparse_solve):
+        for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
+            i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
+            Jaref = Jaref + constraint_state.jac[i_c, i_d, i_b] * qacc[i_d, i_b]
+    else:
+        for i_d in range(n_dofs):
+            Jaref = Jaref + constraint_state.jac[i_c, i_d, i_b] * qacc[i_d, i_b]
+    constraint_state.Jaref[i_c, i_b] = Jaref
+
+
+@qd.func
+def _initialize_Jaref_per_env(
+    qacc: array_class.V_ANNOTATION,
+    constraint_state: array_class.ConstraintState,
+    static_rigid_sim_config: qd.template(),
+):
     _B = constraint_state.jac.shape[2]
     n_dofs = constraint_state.jac.shape[1]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(_B):
         for i_c in range(constraint_state.n_constraints[i_b]):
-            Jaref = -constraint_state.aref[i_c, i_b]
-            if qd.static(static_rigid_sim_config.sparse_solve):
-                for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
-                    i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
-                    Jaref = Jaref + constraint_state.jac[i_c, i_d, i_b] * qacc[i_d, i_b]
-            else:
-                for i_d in range(n_dofs):
-                    Jaref = Jaref + constraint_state.jac[i_c, i_d, i_b] * qacc[i_d, i_b]
-            constraint_state.Jaref[i_c, i_b] = Jaref
+            _initialize_Jaref_body(i_c, i_b, n_dofs, qacc, constraint_state, static_rigid_sim_config)
 
 
 @qd.func
-def initialize_Jaref_parallel(
+def _initialize_Jaref_parallel(
     qacc: array_class.V_ANNOTATION,
     constraint_state: array_class.ConstraintState,
     static_rigid_sim_config: qd.template(),
@@ -2901,15 +2932,7 @@ def initialize_Jaref_parallel(
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_c, i_b in qd.ndrange(len_constraints, _B):
         if i_c < constraint_state.n_constraints[i_b]:
-            Jaref = -constraint_state.aref[i_c, i_b]
-            if qd.static(static_rigid_sim_config.sparse_solve):
-                for i_d_ in range(constraint_state.jac_n_relevant_dofs[i_c, i_b]):
-                    i_d = constraint_state.jac_relevant_dofs[i_c, i_d_, i_b]
-                    Jaref = Jaref + constraint_state.jac[i_c, i_d, i_b] * qacc[i_d, i_b]
-            else:
-                for i_d in range(n_dofs):
-                    Jaref = Jaref + constraint_state.jac[i_c, i_d, i_b] * qacc[i_d, i_b]
-            constraint_state.Jaref[i_c, i_b] = Jaref
+            _initialize_Jaref_body(i_c, i_b, n_dofs, qacc, constraint_state, static_rigid_sim_config)
 
 
 @qd.func
@@ -2937,21 +2960,8 @@ def initialize_Ma(
 # ======================================================= Core ========================================================
 
 
-def func_solve_init(
-    dofs_info,
-    dofs_state,
-    entities_info,
-    constraint_state,
-    rigid_global_info,
-    static_rigid_sim_config,
-):
-    func_solve_init_monolith(
-        dofs_info, dofs_state, entities_info, constraint_state, rigid_global_info, static_rigid_sim_config
-    )
-
-
 @qd.kernel(fastcache=gs.use_fastcache)
-def func_solve_init_monolith(
+def func_solve_init(
     dofs_info: array_class.DofsInfo,
     dofs_state: array_class.DofsState,
     entities_info: array_class.EntitiesInfo,
@@ -2972,19 +2982,11 @@ def func_solve_init_monolith(
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
-
-        if qd.static(static_rigid_sim_config.parallel_init):
-            initialize_Jaref_parallel(
-                qacc=constraint_state.qacc_ws,
-                constraint_state=constraint_state,
-                static_rigid_sim_config=static_rigid_sim_config,
-            )
-        else:
-            initialize_Jaref(
-                qacc=constraint_state.qacc_ws,
-                constraint_state=constraint_state,
-                static_rigid_sim_config=static_rigid_sim_config,
-            )
+        initialize_Jaref(
+            qacc=constraint_state.qacc_ws,
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
         func_update_constraint(
             qacc=constraint_state.qacc_ws,
             Ma=constraint_state.Ma_ws,
@@ -3003,19 +3005,11 @@ def func_solve_init_monolith(
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
-
-        if qd.static(static_rigid_sim_config.parallel_init):
-            initialize_Jaref_parallel(
-                qacc=dofs_state.acc_smooth,
-                constraint_state=constraint_state,
-                static_rigid_sim_config=static_rigid_sim_config,
-            )
-        else:
-            initialize_Jaref(
-                qacc=dofs_state.acc_smooth,
-                constraint_state=constraint_state,
-                static_rigid_sim_config=static_rigid_sim_config,
-            )
+        initialize_Jaref(
+            qacc=dofs_state.acc_smooth,
+            constraint_state=constraint_state,
+            static_rigid_sim_config=static_rigid_sim_config,
+        )
         func_update_constraint(
             qacc=dofs_state.acc_smooth,
             Ma=constraint_state.Ma,
@@ -3050,20 +3044,11 @@ def func_solve_init_monolith(
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
-
-    # Initialize solver accordingly
-    if qd.static(static_rigid_sim_config.parallel_init):
-        initialize_Jaref_parallel(
-            qacc=constraint_state.qacc,
-            constraint_state=constraint_state,
-            static_rigid_sim_config=static_rigid_sim_config,
-        )
-    else:
-        initialize_Jaref(
-            qacc=constraint_state.qacc,
-            constraint_state=constraint_state,
-            static_rigid_sim_config=static_rigid_sim_config,
-        )
+    initialize_Jaref(
+        qacc=constraint_state.qacc,
+        constraint_state=constraint_state,
+        static_rigid_sim_config=static_rigid_sim_config,
+    )
     func_update_constraint(
         qacc=constraint_state.qacc,
         Ma=constraint_state.Ma,
