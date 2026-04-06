@@ -2982,6 +2982,7 @@ def func_solve_init(
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
+
         initialize_Jaref(
             qacc=constraint_state.qacc_ws,
             constraint_state=constraint_state,
@@ -3005,6 +3006,7 @@ def func_solve_init(
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
+
         initialize_Jaref(
             qacc=dofs_state.acc_smooth,
             constraint_state=constraint_state,
@@ -3044,6 +3046,7 @@ def func_solve_init(
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
+
     # Initialize solver accordingly
     initialize_Jaref(
         qacc=constraint_state.qacc,
