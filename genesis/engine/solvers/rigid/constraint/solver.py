@@ -2702,7 +2702,6 @@ def func_update_constraint(
         )
 
 
-
 @qd.func
 def func_update_gradient_batch(
     i_b,
@@ -2883,6 +2882,7 @@ def initialize_Jaref(
             static_rigid_sim_config=static_rigid_sim_config,
         )
 
+
 @qd.func
 def _initialize_Jaref_body(
     i_c,
@@ -3044,6 +3044,7 @@ def func_solve_init(
             rigid_global_info=rigid_global_info,
             static_rigid_sim_config=static_rigid_sim_config,
         )
+    # Initialize solver accordingly
     initialize_Jaref(
         qacc=constraint_state.qacc,
         constraint_state=constraint_state,
