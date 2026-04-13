@@ -1,4 +1,5 @@
 import math
+import sys
 from typing import TYPE_CHECKING, Literal
 
 import quadrants as qd
@@ -370,10 +371,32 @@ class RigidSolver(KinematicSolver):
             return gs.broadphase_traversal.SAP
         return gs.broadphase_traversal.ALL_VS_ALL
 
+    def _should_use_parallel_init(self):
+        """Use parallel init (ndrange over constraints+envs) when envs alone don't saturate the GPU.
+
+        Uses hardware-derived GPU core count to determine saturation threshold, following the same
+        multi-backend pattern as collider.py (line 219).
+        """
+        if gs.backend == gs.cpu or self.sim.options.requires_grad:
+            return False
+        import torch
+
+        if torch.cuda.is_available():
+            gpu_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            # NVIDIA: 128 CUDA cores per SM. AMD/ROCm: 64 stream processors per CU.
+            cores_per_unit = 64 if torch.version.hip else 128
+            gpu_cores = gpu_props.multi_processor_count * cores_per_unit
+        elif gs.backend == gs.metal:
+            # Upper-bound estimate for Apple Silicon: 40 GPU cores × 128 ALUs
+            gpu_cores = 5120
+        else:
+            # Fallback for other GPU backends (e.g. Vulkan)
+            gpu_cores = 16384
+        return self.n_envs <= gpu_cores
+
     def _build_static_config(self):
         prefer_parallel_linesearch = self._options.prefer_parallel_linesearch
-        # FIXME: Enable gs.metal once Quadrants supports shared memory atomics on Apple Metal.
-        if gs.backend in (gs.cpu, gs.metal) or self._enable_mujoco_compatibility or self.sim.options.requires_grad:
+        if gs.backend == gs.cpu or self._enable_mujoco_compatibility or self.sim.options.requires_grad:
             prefer_parallel_linesearch = False
 
         static_rigid_sim_config = dict(
@@ -395,6 +418,7 @@ class RigidSolver(KinematicSolver):
             solver_type=self._options.constraint_solver,
             prefer_parallel_linesearch={None: -1, False: 0, True: 1}[prefer_parallel_linesearch],
             broadphase_traversal=self._resolve_broadphase_traversal(),
+            parallel_init=self._should_use_parallel_init(),
         )
 
         if self.is_active:
@@ -983,8 +1007,9 @@ class RigidSolver(KinematicSolver):
         return qd_to_torch(self._errno) > 0
 
     def check_errno(self):
-        # TODO: Add some class ErrorCode(IntEnum) to manage error codes x)
-        if gs.use_zerocopy:
+        # FIXME: qd.atomic_or return value is broken on Metal — always returns 0.
+        # See repro_metal_kernel_return.py. Falling back to numpy reduction.
+        if gs.use_zerocopy or sys.platform == "darwin":
             errno = np.bitwise_or.reduce(qd_to_numpy(self._errno))
         else:
             errno = kernel_bit_reduction(self._errno)
